@@ -53,6 +53,10 @@ pub struct AiEstimate {
     pub no_probability: f64,
     pub reasoning: String,
     pub token_cost_usd: f64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
 }
 
 pub type ExternalData = serde_json::Value;

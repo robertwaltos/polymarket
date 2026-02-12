@@ -7,14 +7,35 @@ use csv::StringRecord;
 use futures::future::join_all;
 use log::warn;
 use reqwest::Client;
+use reqwest::StatusCode;
+use rsa::pkcs1::DecodeRsaPrivateKey;
+use rsa::pkcs8::DecodePrivateKey;
+use rsa::RsaPrivateKey;
+use sha2::{Digest, Sha256};
+use base64::engine::general_purpose;
+use base64::Engine as _;
 use scraper::{Html, Selector};
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use ethers_contract::Contract;
+use ethers_core::abi::AbiParser;
+use ethers_core::types::Address;
+use ethers_providers::{Http, Provider};
 
 const MAX_BLOB_CHARS: usize = 6000;
 const MAX_RECENT_POLLS: usize = 20;
 const POLL_LOOKBACK_DAYS: i64 = 30;
+const MAX_SOURCE_CHARS: usize = 2500;
+const MAX_ARRAY_ITEMS: usize = 40;
+const MAX_OBJECT_FIELDS: usize = 40;
+const MAX_STRING_CHARS: usize = 600;
+const MAX_PREDICTIT_MARKETS: usize = 50;
+const MAX_PREDICTIT_CONTRACTS: usize = 12;
+const MAX_MANIFOLD_MARKETS: usize = 200;
+const MAX_KALSHI_MARKETS: usize = 200;
+const MAX_NEWS_ARTICLES: usize = 15;
+const MAX_TWEETS: usize = 40;
 
 #[async_trait]
 pub trait ExternalDataSource: Send + Sync {
@@ -33,37 +54,62 @@ pub struct ScraperEngine {
 impl ScraperEngine {
     pub fn new(client: Client, config: Config) -> Self {
         let mut base_sources: Vec<Arc<dyn ExternalDataSource>> = Vec::new();
+        base_sources.push(Arc::new(WeatherStationsSource::new()));
         base_sources.push(Arc::new(NoaaSource::new(config.noaa_endpoint)));
         base_sources.push(Arc::new(RotowireSource::new(config.rotowire_rss)));
         base_sources.push(Arc::new(EspnSource::new(config.espn_injuries_url)));
-        base_sources.push(Arc::new(DuneSource::new(
-            config.dune_api_key,
-            config.dune_query_ids,
-        )));
-        base_sources.push(Arc::new(MoralisSource::new(config.moralis_api_key)));
-        base_sources.push(Arc::new(XSource::new(config.x_bearer_token)));
-        base_sources.push(Arc::new(NewsSource::new(config.news_api_key)));
+        if config.dune_api_key.is_some() && !config.dune_query_ids.is_empty() {
+            base_sources.push(Arc::new(DuneSource::new(
+                config.dune_api_key.clone(),
+                config.dune_query_ids.clone(),
+            )));
+        }
+        if config.moralis_api_key.is_some() {
+            base_sources.push(Arc::new(MoralisSource::new(config.moralis_api_key.clone())));
+        }
+        if config.x_bearer_token.is_some() {
+            base_sources.push(Arc::new(XSource::new(config.x_bearer_token.clone())));
+        }
+        if config.news_api_key.is_some() {
+            base_sources.push(Arc::new(NewsSource::new(config.news_api_key.clone())));
+        }
+
+        let kalshi_source: Arc<dyn ExternalDataSource> = Arc::new(KalshiSource::new(
+            config.kalshi_api_key.clone(),
+            config.kalshi_key_id.clone(),
+            config.kalshi_private_key_b64.clone(),
+            config.kalshi_base_url.clone(),
+        ));
 
         let mut politics_sources: Vec<Arc<dyn ExternalDataSource>> = Vec::new();
         politics_sources.push(Arc::new(FiveThirtyEightSource::new()));
         politics_sources.push(Arc::new(RealClearPoliticsSource::new()));
         politics_sources.push(Arc::new(PredictItSource::new()));
         politics_sources.push(Arc::new(ManifoldSource::new()));
+        politics_sources.push(Arc::clone(&kalshi_source));
 
         let mut betting_sources: Vec<Arc<dyn ExternalDataSource>> = Vec::new();
-        betting_sources.push(Arc::new(BetfairSource::new(
-            config.betfair_app_key.clone(),
-            config.betfair_session.clone(),
-            config.betfair_event_type_ids.clone(),
-        )));
+        if config.betfair_app_key.is_some() && config.betfair_session.is_some() {
+            betting_sources.push(Arc::new(BetfairSource::new(
+                config.betfair_app_key.clone(),
+                config.betfair_session.clone(),
+                config.betfair_event_type_ids.clone(),
+            )));
+        }
         betting_sources.push(Arc::new(CftcSource::new(config.cftc_url.clone())));
-        betting_sources.push(Arc::new(KalshiSource::new(config.kalshi_api_key.clone())));
-        betting_sources.push(Arc::new(SmarketsSource::new(config.smarkets_session.clone())));
-        betting_sources.push(Arc::new(IbkrSource::new(config.ibkr_api_key.clone())));
-        betting_sources.push(Arc::new(OddsApiSource::new(
-            config.odds_api_key.clone(),
-            config.odds_api_sport.clone(),
-        )));
+        betting_sources.push(Arc::clone(&kalshi_source));
+        if config.smarkets_session.is_some() {
+            betting_sources.push(Arc::new(SmarketsSource::new(config.smarkets_session.clone())));
+        }
+        if config.ibkr_api_key.is_some() {
+            betting_sources.push(Arc::new(IbkrSource::new(config.ibkr_api_key.clone())));
+        }
+        if config.odds_api_key.is_some() {
+            betting_sources.push(Arc::new(OddsApiSource::new(
+                config.odds_api_key.clone(),
+                config.odds_api_sport.clone(),
+            )));
+        }
         betting_sources.push(Arc::new(OddsPortalSource::new()));
         betting_sources.push(Arc::new(BetExplorerSource::new()));
         betting_sources.push(Arc::new(OddsSharkSource::new()));
@@ -71,6 +117,11 @@ impl ScraperEngine {
             config.robinhood_predicts_url.clone(),
         )));
         betting_sources.push(Arc::new(ManifoldSource::new()));
+        betting_sources.push(Arc::new(AugurSource::new(
+            config.augur_rpc_url.clone(),
+            config.augur_contract.clone(),
+            config.augur_markets_url.clone(),
+        )));
 
         let mut local_sources: Vec<Arc<dyn ExternalDataSource>> = Vec::new();
         local_sources.push(Arc::new(LocalPollsSource::new(config.local_polls_url.clone())));
@@ -89,6 +140,7 @@ impl ScraperEngine {
         include_politics: bool,
         include_betting: bool,
         include_local: bool,
+        politics_hints: &[String],
     ) -> Result<Value, AgentError> {
         let mut sources: HashMap<String, Arc<dyn ExternalDataSource>> =
             HashMap::new();
@@ -97,6 +149,10 @@ impl ScraperEngine {
             sources.entry(source.name().to_string()).or_insert_with(|| Arc::clone(source));
         }
         if include_politics {
+            let rcp_source = Arc::new(RealClearPoliticsSource::with_hints(
+                politics_hints.to_vec(),
+            ));
+            sources.insert(rcp_source.name().to_string(), rcp_source);
             for source in &self.politics_sources {
                 sources.entry(source.name().to_string()).or_insert_with(|| Arc::clone(source));
             }
@@ -127,7 +183,8 @@ impl ScraperEngine {
         for (name, result) in results {
             match result {
                 Ok(value) => {
-                    map.insert(name.to_string(), value);
+                    let compacted = compact_value(&value);
+                    map.insert(name.to_string(), compacted);
                 }
                 Err(err) => {
                     warn!("Data source {} failed: {}", name, err);
@@ -138,6 +195,158 @@ impl ScraperEngine {
 
         Ok(Value::Object(map))
     }
+}
+
+#[derive(Clone, Copy)]
+struct WeatherStationSpec {
+    city: &'static str,
+    station_id: &'static str,
+    latitude: f64,
+    longitude: f64,
+}
+
+const DEFAULT_WEATHER_STATIONS: [WeatherStationSpec; 12] = [
+    WeatherStationSpec { city: "Dallas", station_id: "KDAL", latitude: 32.8471, longitude: -96.8518 },
+    WeatherStationSpec { city: "New York", station_id: "KJFK", latitude: 40.6413, longitude: -73.7781 },
+    WeatherStationSpec { city: "Chicago", station_id: "KORD", latitude: 41.9742, longitude: -87.9073 },
+    WeatherStationSpec { city: "Los Angeles", station_id: "KLAX", latitude: 33.9416, longitude: -118.4085 },
+    WeatherStationSpec { city: "Miami", station_id: "KMIA", latitude: 25.7959, longitude: -80.2871 },
+    WeatherStationSpec { city: "London", station_id: "EGLL", latitude: 51.4700, longitude: -0.4543 },
+    WeatherStationSpec { city: "Paris", station_id: "LFPG", latitude: 49.0097, longitude: 2.5479 },
+    WeatherStationSpec { city: "Tokyo", station_id: "RJTT", latitude: 35.5494, longitude: 139.7798 },
+    WeatherStationSpec { city: "Sydney", station_id: "YSSY", latitude: -33.9399, longitude: 151.1753 },
+    WeatherStationSpec { city: "Buenos Aires", station_id: "SABE", latitude: -34.5592, longitude: -58.4156 },
+    WeatherStationSpec { city: "Toronto", station_id: "CYYZ", latitude: 43.6777, longitude: -79.6248 },
+    WeatherStationSpec { city: "Berlin", station_id: "EDDB", latitude: 52.3667, longitude: 13.5033 },
+];
+
+struct WeatherStationsSource {
+    stations: Vec<WeatherStationSpec>,
+}
+
+impl WeatherStationsSource {
+    fn new() -> Self {
+        Self {
+            stations: DEFAULT_WEATHER_STATIONS.to_vec(),
+        }
+    }
+}
+
+#[async_trait]
+impl ExternalDataSource for WeatherStationsSource {
+    fn name(&self) -> &'static str {
+        "noaa_station_observations"
+    }
+
+    async fn fetch(&self, client: &Client) -> Result<Value, AgentError> {
+        let futures = self.stations.iter().copied().map(|spec| {
+            let client = client.clone();
+            async move {
+                let url = format!(
+                    "https://api.weather.gov/stations/{}/observations/latest",
+                    spec.station_id
+                );
+                let resp = client
+                    .get(&url)
+                    .header("User-Agent", "polymarket-agent/1.0")
+                    .send()
+                    .await?;
+                if resp.status().is_success() {
+                    let payload: Value = resp.json().await?;
+                    return Ok(weather_station_observation_from_noaa(spec, &payload));
+                }
+
+                let fallback_url = format!(
+                    "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&current=temperature_2m,dew_point_2m,surface_pressure,wind_speed_10m,cloud_cover&temperature_unit=fahrenheit&windspeed_unit=mph",
+                    spec.latitude, spec.longitude
+                );
+                let fallback = client.get(&fallback_url).send().await?;
+                if !fallback.status().is_success() {
+                    return Err(AgentError::BadResponse(format!(
+                        "{} fallback status {}",
+                        spec.station_id,
+                        fallback.status()
+                    )));
+                }
+                let payload: Value = fallback.json().await?;
+                Ok(weather_station_observation_from_open_meteo(spec, &payload))
+            }
+        });
+
+        let mut stations = Vec::new();
+        for result in join_all(futures).await {
+            if let Ok(row) = result {
+                stations.push(row);
+            }
+        }
+
+        if stations.is_empty() {
+            return Ok(Value::Null);
+        }
+
+        Ok(json!({
+            "updated_at": Utc::now().to_rfc3339(),
+            "count": stations.len(),
+            "stations": stations
+        }))
+    }
+}
+
+fn weather_station_observation_from_noaa(spec: WeatherStationSpec, payload: &Value) -> Value {
+    let temp_c = payload["properties"]["temperature"]["value"].as_f64();
+    let temp_f = temp_c.map(|c| (c * 9.0 / 5.0) + 32.0);
+    let dewpoint_c = payload["properties"]["dewpoint"]["value"].as_f64();
+    let dewpoint_f = dewpoint_c.map(|c| (c * 9.0 / 5.0) + 32.0);
+    let wind_m_s = payload["properties"]["windSpeed"]["value"].as_f64();
+    let wind_mph = wind_m_s.map(|mps| mps * 2.23694);
+    let pressure_pa = payload["properties"]["barometricPressure"]["value"].as_f64();
+    let pressure_hpa = pressure_pa.map(|pa| pa / 100.0);
+    let cloud_layers = payload["properties"]["cloudLayers"]
+        .as_array()
+        .map(|layers| layers.len())
+        .unwrap_or(0);
+
+    json!({
+        "city": spec.city,
+        "station_id": spec.station_id,
+        "source": "weather.gov",
+        "latitude": spec.latitude,
+        "longitude": spec.longitude,
+        "observed_at": payload["properties"]["timestamp"],
+        "temperature_c": temp_c,
+        "temperature_f": temp_f,
+        "dewpoint_f": dewpoint_f,
+        "wind_mph": wind_mph,
+        "pressure_hpa": pressure_hpa,
+        "cloud_layers": cloud_layers,
+        "text_description": payload["properties"]["textDescription"],
+    })
+}
+
+fn weather_station_observation_from_open_meteo(
+    spec: WeatherStationSpec,
+    payload: &Value,
+) -> Value {
+    let temp_f = payload["current"]["temperature_2m"].as_f64();
+    let dewpoint_f = payload["current"]["dew_point_2m"].as_f64();
+    let wind_mph = payload["current"]["wind_speed_10m"].as_f64();
+    let pressure_hpa = payload["current"]["surface_pressure"].as_f64();
+    let cloud_cover = payload["current"]["cloud_cover"].as_f64();
+    json!({
+        "city": spec.city,
+        "station_id": spec.station_id,
+        "source": "open-meteo",
+        "latitude": spec.latitude,
+        "longitude": spec.longitude,
+        "observed_at": payload["current"]["time"],
+        "temperature_c": temp_f.map(|f| (f - 32.0) * 5.0 / 9.0),
+        "temperature_f": temp_f,
+        "dewpoint_f": dewpoint_f,
+        "wind_mph": wind_mph,
+        "pressure_hpa": pressure_hpa,
+        "cloud_layers": cloud_cover,
+        "text_description": Value::Null,
+    })
 }
 
 struct NoaaSource {
@@ -173,10 +382,29 @@ impl ExternalDataSource for NoaaSource {
             3,
         )
         .await?;
-        let value: Value = serde_json::from_str(&text).unwrap_or(Value::String(truncate_string(
-            &text,
-            MAX_BLOB_CHARS,
-        )));
+        let mut value: Value =
+            serde_json::from_str(&text).unwrap_or(Value::String(truncate_string(
+                &text,
+                MAX_BLOB_CHARS,
+            )));
+
+        if let Some(periods) = value["properties"]["periods"].as_array() {
+            let trimmed = periods
+                .iter()
+                .take(6)
+                .map(|period| {
+                    json!({
+                        "name": period["name"],
+                        "startTime": period["startTime"],
+                        "temperature": period["temperature"],
+                        "shortForecast": period["shortForecast"],
+                        "windSpeed": period["windSpeed"]
+                    })
+                })
+                .collect::<Vec<_>>();
+            value = json!({ "periods": trimmed });
+        }
+
         Ok(value)
     }
 }
@@ -201,7 +429,7 @@ impl ExternalDataSource for RotowireSource {
         let url = self
             .rss_url
             .clone()
-            .unwrap_or_else(|| "https://www.rotowire.com/basketball/injury-rss.php".to_string());
+            .unwrap_or_else(|| "https://www.rotowire.com/rss/news.php?sport=NBA".to_string());
         let text = retry(
             || async {
                 let resp = client.get(&url).send().await?.error_for_status()?;
@@ -264,7 +492,10 @@ impl ExternalDataSource for EspnSource {
         }
 
         if rows.is_empty() {
-            return Ok(Value::String(truncate_string(&html, MAX_BLOB_CHARS)));
+            return Ok(json!({
+                "parse_failed": true,
+                "rows": []
+            }));
         }
 
         Ok(json!(rows))
@@ -305,12 +536,19 @@ impl ExternalDataSource for DuneSource {
             );
             let result = retry(
                 || async {
-                    let resp = client.get(&url).send().await?.error_for_status()?;
+                    let resp = client.get(&url).send().await?;
+                    if is_optional_http_status(resp.status()) {
+                        return Ok(Value::Null);
+                    }
+                    let resp = resp.error_for_status()?;
                     Ok(resp.json::<Value>().await?)
                 },
                 3,
             )
             .await?;
+            if result.is_null() {
+                return Ok(Value::Null);
+            }
             outputs.push(result);
         }
 
@@ -346,8 +584,11 @@ impl ExternalDataSource for MoralisSource {
                     .get(url)
                     .header("X-API-Key", api_key)
                     .send()
-                    .await?
-                    .error_for_status()?;
+                    .await?;
+                if is_optional_http_status(resp.status()) {
+                    return Ok(Value::Null);
+                }
+                let resp = resp.error_for_status()?;
                 Ok(resp.json::<Value>().await?)
             },
             3,
@@ -390,15 +631,35 @@ impl ExternalDataSource for XSource {
                     .get(&url)
                     .header("Authorization", format!("Bearer {}", bearer_token))
                     .send()
-                    .await?
-                    .error_for_status()?;
+                    .await?;
+                if is_optional_http_status(resp.status()) {
+                    return Ok(Value::Null);
+                }
+                let resp = resp.error_for_status()?;
                 Ok(resp.json::<Value>().await?)
             },
             3,
         )
         .await?;
+        if response.is_null() {
+            return Ok(Value::Null);
+        }
 
-        Ok(response)
+        let tweets = response["data"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .take(MAX_TWEETS)
+            .map(|tweet| {
+                json!({
+                    "text": truncate_string(tweet["text"].as_str().unwrap_or(""), MAX_STRING_CHARS),
+                    "metrics": tweet["public_metrics"]
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(json!({ "tweets": tweets }))
     }
 }
 
@@ -432,14 +693,36 @@ impl ExternalDataSource for NewsSource {
 
         let response = retry(
             || async {
-                let resp = client.get(&url).send().await?.error_for_status()?;
+                let resp = client.get(&url).send().await?;
+                if is_optional_http_status(resp.status()) {
+                    return Ok(Value::Null);
+                }
+                let resp = resp.error_for_status()?;
                 Ok(resp.json::<Value>().await?)
             },
             3,
         )
         .await?;
+        if response.is_null() {
+            return Ok(Value::Null);
+        }
 
-        Ok(response)
+        let articles = response["articles"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .take(MAX_NEWS_ARTICLES)
+            .map(|article| {
+                json!({
+                    "title": truncate_string(article["title"].as_str().unwrap_or(""), MAX_STRING_CHARS),
+                    "source": article["source"]["name"].as_str().unwrap_or(""),
+                    "publishedAt": article["publishedAt"].as_str().unwrap_or("")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(json!({ "articles": articles }))
     }
 }
 
@@ -451,10 +734,10 @@ impl FiveThirtyEightSource {
     fn new() -> Self {
         Self {
             urls: vec![
-                "https://raw.githubusercontent.com/fivethirtyeight/data/master/polls/president_polls.csv",
-                "https://raw.githubusercontent.com/fivethirtyeight/data/master/polls/senate_polls.csv",
-                "https://raw.githubusercontent.com/fivethirtyeight/data/master/polls/house_polls.csv",
-                "https://raw.githubusercontent.com/fivethirtyeight/data/master/polls/generic_ballot_polls.csv",
+                "https://projects.fivethirtyeight.com/polls-page/data/president_polls.csv",
+                "https://projects.fivethirtyeight.com/polls-page/data/senate_polls.csv",
+                "https://projects.fivethirtyeight.com/polls-page/data/house_polls.csv",
+                "https://projects.fivethirtyeight.com/polls-page/data/generic_ballot_polls.csv",
             ],
         }
     }
@@ -575,11 +858,16 @@ impl ExternalDataSource for FiveThirtyEightSource {
 }
 
 struct RealClearPoliticsSource {
+    hints: Vec<String>,
 }
 
 impl RealClearPoliticsSource {
     fn new() -> Self {
-        Self {}
+        Self { hints: Vec::new() }
+    }
+
+    fn with_hints(hints: Vec<String>) -> Self {
+        Self { hints }
     }
 }
 
@@ -594,7 +882,7 @@ impl ExternalDataSource for RealClearPoliticsSource {
         let cutoff = now - ChronoDuration::days(POLL_LOOKBACK_DAYS);
         let mut sources = Vec::new();
 
-        let urls = discover_rcp_urls(client).await?;
+        let urls = discover_rcp_urls(client, self.hints.as_slice()).await?;
         for url in urls {
             let html = retry(
                 || async {
@@ -768,6 +1056,7 @@ impl ExternalDataSource for PredictItSource {
             let contracts_array = market["contracts"].as_array().cloned().unwrap_or_default();
             let contracts = contracts_array
                 .iter()
+                .take(MAX_PREDICTIT_CONTRACTS)
                 .map(|contract| {
                     json!({
                         "name": contract["name"].as_str().unwrap_or(""),
@@ -782,6 +1071,10 @@ impl ExternalDataSource for PredictItSource {
                 "name": name,
                 "contracts": contracts
             }));
+
+            if filtered.len() >= MAX_PREDICTIT_MARKETS {
+                break;
+            }
         }
 
         Ok(json!({ "markets": filtered }))
@@ -833,11 +1126,82 @@ impl ExternalDataSource for ManifoldSource {
                 "id": market["id"],
                 "question": question,
                 "probability": market["probability"],
-                "liquidity": market["totalLiquidity"]
+                "liquidity": market["totalLiquidity"],
+                "volume": market["volume"],
+                "closeTime": market["closeTime"]
             }));
+
+            if filtered.len() >= MAX_MANIFOLD_MARKETS {
+                break;
+            }
         }
 
         Ok(json!({ "markets": filtered }))
+    }
+}
+
+struct AugurSource {
+    rpc_url: Option<String>,
+    contract: Option<String>,
+    markets_url: Option<String>,
+}
+
+impl AugurSource {
+    fn new(rpc_url: Option<String>, contract: Option<String>, markets_url: Option<String>) -> Self {
+        Self {
+            rpc_url,
+            contract,
+            markets_url,
+        }
+    }
+}
+
+#[async_trait]
+impl ExternalDataSource for AugurSource {
+    fn name(&self) -> &'static str {
+        "augur_markets"
+    }
+
+    async fn fetch(&self, client: &Client) -> Result<Value, AgentError> {
+        if let Some(url) = &self.markets_url {
+            let payload = retry(
+                || async {
+                    let resp = client.get(url).send().await?.error_for_status()?;
+                    Ok(resp.json::<Value>().await?)
+                },
+                3,
+            )
+            .await?;
+            return Ok(payload);
+        }
+
+        let (Some(rpc_url), Some(contract)) = (&self.rpc_url, &self.contract) else {
+            return Ok(Value::Null);
+        };
+
+        let provider = Provider::<Http>::try_from(rpc_url.as_str())
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+        let abi = AbiParser::default()
+            .parse_str("function getMarkets() view returns (address[])")
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+        let address: Address = contract
+            .parse::<Address>()
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+        let contract = Contract::new(address, abi, Arc::new(provider));
+        let markets: Vec<Address> = contract
+            .method::<_, Vec<Address>>("getMarkets", ())
+            .map_err(|e| AgentError::Internal(e.to_string()))?
+            .call()
+            .await
+            .map_err(|e| AgentError::Internal(e.to_string()))?;
+
+        let formatted = markets
+            .into_iter()
+            .map(|addr| format!("{:?}", addr))
+            .collect::<Vec<_>>();
+
+        Ok(json!({ "markets": formatted }))
     }
 }
 
@@ -919,10 +1283,7 @@ impl ExternalDataSource for CftcSource {
     }
 
     async fn fetch(&self, client: &Client) -> Result<Value, AgentError> {
-        let default_url = format!(
-            "https://publicreporting.cftc.gov/api/v1/cot/report?reportType=legacy_futures&reportYear={}",
-            Utc::now().year()
-        );
+        let default_url = "https://www.cftc.gov/dea/newcot/f_disagg.txt".to_string();
         let url = self.url.clone().unwrap_or(default_url);
         let text = retry(
             || async {
@@ -954,11 +1315,24 @@ impl ExternalDataSource for CftcSource {
 
 struct KalshiSource {
     api_key: Option<String>,
+    key_id: Option<String>,
+    private_key_b64: Option<String>,
+    base_url: String,
 }
 
 impl KalshiSource {
-    fn new(api_key: Option<String>) -> Self {
-        Self { api_key }
+    fn new(
+        api_key: Option<String>,
+        key_id: Option<String>,
+        private_key_b64: Option<String>,
+        base_url: String,
+    ) -> Self {
+        Self {
+            api_key,
+            key_id,
+            private_key_b64,
+            base_url,
+        }
     }
 }
 
@@ -969,27 +1343,155 @@ impl ExternalDataSource for KalshiSource {
     }
 
     async fn fetch(&self, client: &Client) -> Result<Value, AgentError> {
-        let Some(api_key) = &self.api_key else {
-            return Ok(Value::Null);
-        };
+        let path = "/trade-api/v2/markets";
+        let url = format!(
+            "{}{}?status=open&limit=1000",
+            self.base_url, path
+        );
 
-        let url = "https://trading-api.kalshi.com/trade-api/v2/markets?status=open&limit=100";
+        let key_id = self.key_id.clone().or(self.api_key.clone());
+        if let (Some(key_id), Some(priv_raw)) = (key_id, &self.private_key_b64) {
+            let private_key = parse_kalshi_private_key(priv_raw)?;
+
+            let timestamp = Utc::now().timestamp_millis();
+            let sign_str = format!("{}{}{}", timestamp, "GET", path);
+            let mut hasher = Sha256::new();
+            hasher.update(sign_str.as_bytes());
+            let hash = hasher.finalize();
+            let mut rng = rand::rngs::OsRng;
+            let signature = private_key
+                .sign_with_rng(&mut rng, rsa::Pss::new::<Sha256>(), &hash)
+                .map_err(|e| AgentError::Parse(format!("kalshi sign: {}", e)))?;
+            let sig_b64 = general_purpose::STANDARD.encode(signature);
+
+            let payload = retry(
+                || async {
+                    let resp = client
+                        .get(&url)
+                        .header("KALSHI-ACCESS-KEY", key_id.clone())
+                        .header("KALSHI-ACCESS-TIMESTAMP", timestamp.to_string())
+                        .header("KALSHI-ACCESS-SIGNATURE", sig_b64.clone())
+                        .send()
+                        .await?
+                        .error_for_status()?;
+                    Ok(resp.json::<Value>().await?)
+                },
+                3,
+            )
+            .await?;
+
+            return Ok(format_kalshi_markets(payload));
+        }
+
         let payload = retry(
             || async {
-                let resp = client
-                    .get(url)
-                    .header("Authorization", format!("Bearer {}", api_key))
-                    .send()
-                    .await?
-                    .error_for_status()?;
+                let resp = client.get(&url).send().await?.error_for_status()?;
                 Ok(resp.json::<Value>().await?)
             },
             3,
         )
         .await?;
 
-        Ok(payload)
+        Ok(format_kalshi_markets(payload))
     }
+}
+
+fn parse_kalshi_private_key(raw: &str) -> Result<RsaPrivateKey, AgentError> {
+    if raw.contains("BEGIN RSA PRIVATE KEY") {
+        return RsaPrivateKey::from_pkcs1_pem(raw)
+            .map_err(|e| AgentError::Parse(format!("kalshi key parse: {}", e)));
+    }
+    if raw.contains("BEGIN PRIVATE KEY") {
+        return RsaPrivateKey::from_pkcs8_pem(raw)
+            .map_err(|e| AgentError::Parse(format!("kalshi key parse: {}", e)));
+    }
+    if raw.contains("BEGIN") {
+        let pkcs8 = RsaPrivateKey::from_pkcs8_pem(raw);
+        if let Ok(key) = pkcs8 {
+            return Ok(key);
+        }
+        let pkcs1 = RsaPrivateKey::from_pkcs1_pem(raw);
+        if let Ok(key) = pkcs1 {
+            return Ok(key);
+        }
+        return Err(AgentError::Parse("kalshi key parse: unsupported PEM label".to_string()));
+    }
+
+    let decoded = general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|e| AgentError::Parse(format!("kalshi key decode: {}", e)))?;
+
+    if let Ok(pem) = std::str::from_utf8(&decoded) {
+        if pem.contains("BEGIN RSA PRIVATE KEY") {
+            return RsaPrivateKey::from_pkcs1_pem(pem)
+                .map_err(|e| AgentError::Parse(format!("kalshi key parse: {}", e)));
+        }
+        if pem.contains("BEGIN PRIVATE KEY") {
+            return RsaPrivateKey::from_pkcs8_pem(pem)
+                .map_err(|e| AgentError::Parse(format!("kalshi key parse: {}", e)));
+        }
+        if pem.contains("BEGIN") {
+            let pkcs8 = RsaPrivateKey::from_pkcs8_pem(pem);
+            if let Ok(key) = pkcs8 {
+                return Ok(key);
+            }
+            let pkcs1 = RsaPrivateKey::from_pkcs1_pem(pem);
+            if let Ok(key) = pkcs1 {
+                return Ok(key);
+            }
+        }
+    }
+
+    if let Ok(key) = RsaPrivateKey::from_pkcs8_der(&decoded) {
+        return Ok(key);
+    }
+    if let Ok(key) = RsaPrivateKey::from_pkcs1_der(&decoded) {
+        return Ok(key);
+    }
+    Err(AgentError::Parse("kalshi key parse: unsupported key format".to_string()))
+}
+
+fn format_kalshi_markets(payload: Value) -> Value {
+    let markets = payload["markets"].as_array().cloned().unwrap_or_default();
+    let mut filtered = Vec::new();
+    for market in markets {
+        let category = market["category"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase();
+        if !(category.contains("politics")
+            || category.contains("weather")
+            || category.contains("sports")
+            || category.contains("crypto"))
+        {
+            continue;
+        }
+
+        let yes_raw = market["yes_bid"]
+            .as_f64()
+            .or_else(|| market["yes_ask"].as_f64())
+            .or_else(|| market["last_price"].as_f64())
+            .unwrap_or(0.0);
+        if yes_raw <= 0.0 {
+            continue;
+        }
+        let yes_prob = if yes_raw > 1.0 { yes_raw / 100.0 } else { yes_raw };
+
+        filtered.push(json!({
+            "ticker": market["ticker"],
+            "title": market["title"],
+            "subtitle": market["subtitle"],
+            "yes_prob": yes_prob,
+            "volume_24h": market["volume_24h"],
+            "liquidity": market["liquidity"]
+        }));
+
+        if filtered.len() >= MAX_KALSHI_MARKETS {
+            break;
+        }
+    }
+
+    json!({ "markets": filtered })
 }
 
 struct SmarketsSource {
@@ -1152,7 +1654,10 @@ impl ExternalDataSource for OddsPortalSource {
         }
 
         if rows.is_empty() {
-            return Ok(Value::String(truncate_string(&html, MAX_BLOB_CHARS)));
+            return Ok(json!({
+                "parse_failed": true,
+                "rows": []
+            }));
         }
 
         Ok(json!(rows))
@@ -1174,7 +1679,7 @@ impl ExternalDataSource for BetExplorerSource {
     }
 
     async fn fetch(&self, client: &Client) -> Result<Value, AgentError> {
-        let url = "https://www.betexplorer.com/odds/";
+        let url = "https://www.betexplorer.com/";
         let html = retry(
             || async {
                 let resp = client
@@ -1204,7 +1709,10 @@ impl ExternalDataSource for BetExplorerSource {
         }
 
         if rows.is_empty() {
-            return Ok(Value::String(truncate_string(&html, MAX_BLOB_CHARS)));
+            return Ok(json!({
+                "parse_failed": true,
+                "rows": []
+            }));
         }
 
         Ok(json!(rows))
@@ -1256,7 +1764,10 @@ impl ExternalDataSource for OddsSharkSource {
         }
 
         if rows.is_empty() {
-            return Ok(Value::String(truncate_string(&html, MAX_BLOB_CHARS)));
+            return Ok(json!({
+                "parse_failed": true,
+                "rows": []
+            }));
         }
 
         Ok(json!(rows))
@@ -1466,6 +1977,38 @@ fn parse_percent(value: &str) -> Option<f64> {
     Some(pct)
 }
 
+fn compact_value(value: &Value) -> Value {
+    let compacted = compact_value_inner(value);
+    let serialized = serde_json::to_string(&compacted).unwrap_or_default();
+    if serialized.len() > MAX_SOURCE_CHARS {
+        Value::String(truncate_string(&serialized, MAX_SOURCE_CHARS))
+    } else {
+        compacted
+    }
+}
+
+fn compact_value_inner(value: &Value) -> Value {
+    match value {
+        Value::String(text) => Value::String(truncate_string(text, MAX_STRING_CHARS)),
+        Value::Array(items) => {
+            let trimmed = items
+                .iter()
+                .take(MAX_ARRAY_ITEMS)
+                .map(compact_value_inner)
+                .collect::<Vec<_>>();
+            Value::Array(trimmed)
+        }
+        Value::Object(map) => {
+            let mut trimmed = Map::new();
+            for (key, val) in map.iter().take(MAX_OBJECT_FIELDS) {
+                trimmed.insert(key.clone(), compact_value_inner(val));
+            }
+            Value::Object(trimmed)
+        }
+        other => other.clone(),
+    }
+}
+
 fn is_rcp_meta_field(key: &str) -> bool {
     matches!(key, "Date" | "Poll" | "Sample" | "MoE" | "Spread")
 }
@@ -1484,8 +2027,11 @@ fn parse_month_day(value: &str) -> Option<(u32, u32)> {
     Some((month, day))
 }
 
-async fn discover_rcp_urls(client: &Client) -> Result<Vec<String>, AgentError> {
-    let main_url = "https://www.realclearpolling.com/polls";
+async fn discover_rcp_urls(
+    client: &Client,
+    hints: &[String],
+) -> Result<Vec<String>, AgentError> {
+    let main_url = "https://www.realclearpolling.com/latest-polls";
     let html = retry(
         || async {
             let resp = client
@@ -1501,34 +2047,63 @@ async fn discover_rcp_urls(client: &Client) -> Result<Vec<String>, AgentError> {
     .await?;
 
     let doc = Html::parse_document(&html);
-    let selector = Selector::parse("a[href^='/polls/']").unwrap();
+    let selectors = [
+        Selector::parse("a[href^='/latest-polls/']").unwrap(),
+        Selector::parse("a[href^='/polls/']").unwrap(),
+    ];
     let mut urls = HashSet::new();
-    for link in doc.select(&selector) {
-        let Some(href) = link.value().attr("href") else {
-            continue;
-        };
-        let href_lower = href.to_lowercase();
-        if !(href_lower.contains("2026")
-            || href_lower.contains("2028")
-            || href_lower.contains("president")
-            || href_lower.contains("senate")
-            || href_lower.contains("house")
-            || href_lower.contains("generic"))
-        {
-            continue;
+    for selector in &selectors {
+        for link in doc.select(selector) {
+            let Some(href) = link.value().attr("href") else {
+                continue;
+            };
+            let href_lower = href.to_lowercase();
+            if !(href_lower.contains("2026")
+                || href_lower.contains("2028")
+                || href_lower.contains("president")
+                || href_lower.contains("senate")
+                || href_lower.contains("house")
+                || href_lower.contains("generic")
+                || href_lower.contains("election")
+                || href_lower.contains("governor"))
+            {
+                continue;
+            }
+            let full = if href.starts_with("http") {
+                href.to_string()
+            } else {
+                format!("https://www.realclearpolling.com{}", href)
+            };
+            urls.insert(full);
         }
-        let full = if href.starts_with("http") {
-            href.to_string()
-        } else {
-            format!("https://www.realclearpolling.com{}", href)
-        };
-        urls.insert(full);
     }
 
     let mut urls: Vec<String> = urls.into_iter().collect();
     urls.sort();
-    if urls.len() > 10 {
-        urls.truncate(10);
+    if urls.is_empty() {
+        urls.push(main_url.to_string());
+    }
+
+    if !hints.is_empty() {
+        let hint_set = hints
+            .iter()
+            .map(|h| h.to_lowercase())
+            .collect::<Vec<_>>();
+        let filtered = urls
+            .iter()
+            .cloned()
+            .filter(|url| {
+                let lower = url.to_lowercase();
+                hint_set.iter().any(|hint| lower.contains(hint))
+            })
+            .collect::<Vec<_>>();
+        if !filtered.is_empty() {
+            urls = filtered;
+        }
+    }
+
+    if urls.len() > 8 {
+        urls.truncate(8);
     }
     Ok(urls)
 }
@@ -1546,4 +2121,15 @@ fn matches_politics_keywords(text: &str) -> bool {
         "2028",
     ];
     keywords.iter().any(|k| text.contains(k))
+}
+
+fn is_optional_http_status(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::UNAUTHORIZED
+            | StatusCode::FORBIDDEN
+            | StatusCode::NOT_FOUND
+            | StatusCode::PAYMENT_REQUIRED
+            | StatusCode::TOO_MANY_REQUESTS
+    )
 }

@@ -2,7 +2,7 @@ use rand::Rng;
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
-struct StateKey {
+pub(crate) struct StateKey {
     edge_bucket: i32,
     bankroll_bucket: i32,
 }
@@ -60,12 +60,29 @@ impl QLearningAgent {
     }
 
     pub fn update(&mut self, state: StateKey, action: usize, reward: f64, next_state: StateKey) {
+        let max_next = {
+            let next_values = self.q_table.entry(next_state).or_insert([0.0; 3]);
+            next_values
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
         let q_values = self.q_table.entry(state).or_insert([0.0; 3]);
-        let next_values = self.q_table.entry(next_state).or_insert([0.0; 3]);
-        let max_next = next_values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let target = reward + self.gamma * max_next;
         let current = q_values[action];
         q_values[action] = current + self.alpha * (target - current);
+    }
+
+    pub fn set_alpha(&mut self, alpha: f64) {
+        if alpha > 0.0 {
+            self.alpha = alpha;
+        }
+    }
+
+    pub fn set_epsilon(&mut self, epsilon: f64) {
+        if (0.0..=1.0).contains(&epsilon) {
+            self.epsilon = epsilon;
+        }
     }
 }
 

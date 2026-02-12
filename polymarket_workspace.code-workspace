@@ -4,5 +4,12 @@
 			"path": "."
 		}
 	],
-	"settings": {}
+	"settings": {
+		"python.analysis.extraPaths": [
+			"market_monitor",
+			"scripts",
+			"c:\\Users\\rober\\.vscode\\extensions\\ms-security.ms-sentinel-1.1.1\\python",
+			"c:\\Users\\rober\\.vscode\\extensions\\ms-security.ms-sentinel-1.2.0\\python"
+		]
+	}
 }

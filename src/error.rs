@@ -18,6 +18,8 @@ pub enum AgentError {
     Anthropic(String),
     #[error("clob api error: {0}")]
     Clob(String),
+    #[error("kalshi api error: {0}")]
+    Kalshi(String),
     #[error("wallet error: {0}")]
     Wallet(String),
     #[error("internal error: {0}")]
