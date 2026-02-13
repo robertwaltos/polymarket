@@ -1,0 +1,14 @@
+[package]
+name = "backtest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+domain = { path = "../domain" }
+oms = { path = "../oms" }
+portfolio = { path = "../portfolio" }
+risk = { path = "../risk" }
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true

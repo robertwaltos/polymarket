@@ -1,0 +1,39 @@
+name: Auth Smoke
+
+on:
+  pull_request:
+    paths:
+      - "platform/**"
+      - "docs/**"
+      - ".github/workflows/auth-smoke.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "platform/**"
+      - "docs/**"
+      - ".github/workflows/auth-smoke.yml"
+
+jobs:
+  auth-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: platform
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            platform -> target
+
+      - name: Run auth smoke CI script
+        run: bash scripts/ci_auth_smoke.sh

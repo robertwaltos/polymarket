@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "apps/trading-server",
+    "crates/domain",
+    "crates/venue_adapters",
+    "crates/oms",
+    "crates/portfolio",
+    "crates/risk",
+    "crates/backtest",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Trading Platform Team"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.43", features = ["full"] }
+async-trait = "0.1"
+reqwest = { version = "0.11.27", features = ["json", "rustls-tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "=1.7.0", features = ["v4", "serde"] }
+indexmap = { version = "2.6", features = ["serde"] }
+base64 = "0.22"
+base64ct = "=1.6.0"
+hmac = "0.12"
+rsa = { version = "=0.9.2", features = ["pem", "sha2"] }
+sha2 = "0.10"
+dotenvy = "0.15"
