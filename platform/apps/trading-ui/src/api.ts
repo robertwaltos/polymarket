@@ -1,11 +1,14 @@
 import type {
   AuthLoginResponse,
   HealthResponse,
+  LiveGuardSnapshot,
+  LiveKillSwitchInput,
   PlaceOrderInput,
   PlaceOrderResponse,
   PortfolioHistoryResponse,
   PortfolioResponse,
-  RecentOrdersResponse
+  RecentOrdersResponse,
+  VenueGuardControlInput
 } from "./types";
 
 export class ApiClient {
@@ -55,6 +58,35 @@ export class ApiClient {
     return this.request<RecentOrdersResponse>(
       `/v1/orders/recent?limit=${encodeURIComponent(limit)}`,
       { method: "GET" },
+      true
+    );
+  }
+
+  async liveGuards(): Promise<LiveGuardSnapshot> {
+    return this.request<LiveGuardSnapshot>("/v1/execution/guards", { method: "GET" }, true);
+  }
+
+  async setLiveKillSwitch(payload: LiveKillSwitchInput): Promise<LiveGuardSnapshot> {
+    return this.request<LiveGuardSnapshot>(
+      "/v1/execution/guards/kill-switch",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      true
+    );
+  }
+
+  async setVenueGuard(
+    venue: "coinbase" | "ibkr" | "kalshi",
+    payload: VenueGuardControlInput
+  ): Promise<LiveGuardSnapshot> {
+    return this.request<LiveGuardSnapshot>(
+      `/v1/execution/guards/venues/${encodeURIComponent(venue)}`,
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
       true
     );
   }

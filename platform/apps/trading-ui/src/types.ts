@@ -8,6 +8,40 @@ export interface HealthResponse {
   db_enabled: boolean;
 }
 
+export interface LiveGuardConfig {
+  require_healthy: boolean;
+  max_health_age_secs: number;
+  failure_threshold: number;
+  cooldown_secs: number;
+  health_poll_interval_secs: number;
+}
+
+export interface LiveGuardGlobalState {
+  kill_switch_enabled: boolean;
+  kill_switch_reason: string | null;
+  kill_switch_updated_at: string;
+}
+
+export interface LiveGuardVenueState {
+  venue: PlaceOrderInput["venue"];
+  live_enabled: boolean;
+  live_allowed_now: boolean;
+  block_reason: string | null;
+  consecutive_live_failures: number;
+  breaker_open: boolean;
+  breaker_open_until: string | null;
+  last_health_ok: boolean | null;
+  last_health_detail: string | null;
+  last_health_at: string | null;
+  updated_at: string;
+}
+
+export interface LiveGuardSnapshot {
+  config: LiveGuardConfig;
+  global: LiveGuardGlobalState;
+  venues: LiveGuardVenueState[];
+}
+
 export interface AuthLoginResponse {
   access_token: string;
   refresh_token: string;
@@ -96,4 +130,14 @@ export interface PlaceOrderResponse {
     label: string;
     role: string;
   };
+}
+
+export interface LiveKillSwitchInput {
+  enabled: boolean;
+  reason?: string;
+}
+
+export interface VenueGuardControlInput {
+  live_enabled?: boolean;
+  reset_breaker?: boolean;
 }

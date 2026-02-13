@@ -4,8 +4,8 @@ use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -17,20 +17,21 @@ use domain::{
 };
 use dotenvy::dotenv;
 use hmac::{Hmac, Mac};
-use oms::{JsonlAuditStore, OmsConfig, OmsEngine, OrderAuditRecord};
+use oms::{JsonlAuditStore, OmsConfig, OmsEngine, OmsError, OrderAuditRecord};
 use portfolio::PortfolioState;
 use risk::{RiskEngine, RiskLimits};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
+use tokio::time::MissedTickBehavior;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::{info, warn};
@@ -47,6 +48,7 @@ struct AppState {
     default_mode: ExecutionMode,
     db: Option<Arc<PgStore>>,
     rate_limiter: OrgRateLimiter,
+    live_guard: LiveExecutionGuard,
     event_bus: EventBus,
 }
 
@@ -101,6 +103,18 @@ impl OmsManager {
         );
         guard.insert(org_id, engine.clone());
         Ok(engine)
+    }
+
+    fn adapter_registry(&self) -> AdapterRegistry {
+        self.adapters.clone()
+    }
+
+    fn configured_venues(&self) -> Vec<Venue> {
+        self.adapters
+            .all()
+            .into_iter()
+            .map(|adapter| adapter.venue())
+            .collect()
     }
 }
 
@@ -162,6 +176,456 @@ impl EventBus {
             payload,
             at: Utc::now(),
         });
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LiveGuardConfig {
+    health_poll_interval_secs: u64,
+    max_health_age_secs: i64,
+    failure_threshold: u32,
+    cooldown_secs: i64,
+    require_healthy: bool,
+}
+
+impl LiveGuardConfig {
+    fn from_env() -> Self {
+        Self {
+            health_poll_interval_secs: env_u64("LIVE_GUARD_HEALTH_POLL_SECS", 10),
+            max_health_age_secs: env_i64("LIVE_GUARD_HEALTH_MAX_AGE_SECS", 45),
+            failure_threshold: env_u32("LIVE_GUARD_FAILURE_THRESHOLD", 3),
+            cooldown_secs: env_i64("LIVE_GUARD_COOLDOWN_SECS", 120),
+            require_healthy: env_bool("LIVE_GUARD_REQUIRE_HEALTHY", true),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VenueHealthState {
+    ok: bool,
+    detail: String,
+    checked_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct VenueLiveGuardState {
+    live_enabled: bool,
+    consecutive_live_failures: u32,
+    breaker_open_until: Option<DateTime<Utc>>,
+    last_health: Option<VenueHealthState>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct LiveGuardState {
+    kill_switch_enabled: bool,
+    kill_switch_reason: Option<String>,
+    kill_switch_updated_at: DateTime<Utc>,
+    venues: HashMap<Venue, VenueLiveGuardState>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LiveGuardConfigView {
+    require_healthy: bool,
+    max_health_age_secs: i64,
+    failure_threshold: u32,
+    cooldown_secs: i64,
+    health_poll_interval_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LiveGuardGlobalView {
+    kill_switch_enabled: bool,
+    kill_switch_reason: Option<String>,
+    kill_switch_updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LiveGuardVenueView {
+    venue: String,
+    live_enabled: bool,
+    live_allowed_now: bool,
+    block_reason: Option<String>,
+    consecutive_live_failures: u32,
+    breaker_open: bool,
+    breaker_open_until: Option<DateTime<Utc>>,
+    last_health_ok: Option<bool>,
+    last_health_detail: Option<String>,
+    last_health_at: Option<DateTime<Utc>>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LiveGuardSnapshot {
+    config: LiveGuardConfigView,
+    global: LiveGuardGlobalView,
+    venues: Vec<LiveGuardVenueView>,
+}
+
+#[derive(Clone)]
+struct LiveExecutionGuard {
+    config: LiveGuardConfig,
+    state: Arc<Mutex<LiveGuardState>>,
+}
+
+impl LiveExecutionGuard {
+    fn new(configured_venues: Vec<Venue>, config: LiveGuardConfig) -> Self {
+        let now = Utc::now();
+        let disabled = env_csv_lower("LIVE_GUARD_DISABLED_VENUES");
+        let mut venues = HashMap::new();
+        for venue in configured_venues {
+            let enabled = !disabled.contains(&venue_code(&venue).to_ascii_lowercase());
+            venues.insert(
+                venue,
+                VenueLiveGuardState {
+                    live_enabled: enabled,
+                    consecutive_live_failures: 0,
+                    breaker_open_until: None,
+                    last_health: None,
+                    updated_at: now,
+                },
+            );
+        }
+
+        Self {
+            config,
+            state: Arc::new(Mutex::new(LiveGuardState {
+                kill_switch_enabled: false,
+                kill_switch_reason: None,
+                kill_switch_updated_at: now,
+                venues,
+            })),
+        }
+    }
+
+    fn poll_interval_secs(&self) -> u64 {
+        self.config.health_poll_interval_secs.max(3)
+    }
+
+    fn authorize_live(&self, venue: &Venue, now: DateTime<Utc>) -> Result<(), String> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| "live guard lock poisoned".to_string())?;
+        if guard.kill_switch_enabled {
+            let reason = guard
+                .kill_switch_reason
+                .clone()
+                .unwrap_or_else(|| "operator kill switch engaged".to_string());
+            return Err(format!("live execution blocked: {reason}"));
+        }
+
+        let Some(venue_state) = guard.venues.get_mut(venue) else {
+            return Err(format!(
+                "live guard not configured for venue {}",
+                venue_code(venue)
+            ));
+        };
+
+        if !venue_state.live_enabled {
+            return Err(format!(
+                "live execution blocked: venue {} is disabled by operator policy",
+                venue_code(venue)
+            ));
+        }
+
+        if let Some(until) = venue_state.breaker_open_until {
+            if until > now {
+                return Err(format!(
+                    "live execution blocked: venue {} circuit breaker open until {}",
+                    venue_code(venue),
+                    until.to_rfc3339()
+                ));
+            }
+            venue_state.breaker_open_until = None;
+            venue_state.consecutive_live_failures = 0;
+            venue_state.updated_at = now;
+        }
+
+        if self.config.require_healthy {
+            let Some(health) = venue_state.last_health.as_ref() else {
+                return Err(format!(
+                    "live execution blocked: venue {} has no health report yet",
+                    venue_code(venue)
+                ));
+            };
+
+            if !health.ok {
+                return Err(format!(
+                    "live execution blocked: venue {} health check failing ({})",
+                    venue_code(venue),
+                    health.detail
+                ));
+            }
+
+            let age_secs = now.signed_duration_since(health.checked_at).num_seconds();
+            if age_secs > self.config.max_health_age_secs {
+                return Err(format!(
+                    "live execution blocked: venue {} health stale ({}s old)",
+                    venue_code(venue),
+                    age_secs
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn note_health(
+        &self,
+        venue: &Venue,
+        ok: bool,
+        detail: String,
+        checked_at: DateTime<Utc>,
+    ) -> Result<bool> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("live guard lock poisoned"))?;
+        let Some(venue_state) = guard.venues.get_mut(venue) else {
+            return Err(anyhow!(
+                "live guard not configured for venue {}",
+                venue_code(venue)
+            ));
+        };
+        let changed = match &venue_state.last_health {
+            Some(existing) => existing.ok != ok || existing.detail != detail,
+            None => true,
+        };
+
+        venue_state.last_health = Some(VenueHealthState {
+            ok,
+            detail,
+            checked_at,
+        });
+        venue_state.updated_at = Utc::now();
+        Ok(changed)
+    }
+
+    fn record_live_result(
+        &self,
+        venue: &Venue,
+        success: bool,
+        detail: &str,
+    ) -> Result<Option<String>> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("live guard lock poisoned"))?;
+        let Some(venue_state) = guard.venues.get_mut(venue) else {
+            return Err(anyhow!(
+                "live guard not configured for venue {}",
+                venue_code(venue)
+            ));
+        };
+
+        let now = Utc::now();
+        if success {
+            let had_failures = venue_state.consecutive_live_failures > 0
+                || venue_state.breaker_open_until.is_some();
+            venue_state.consecutive_live_failures = 0;
+            venue_state.breaker_open_until = None;
+            venue_state.updated_at = now;
+            if had_failures {
+                return Ok(Some(format!(
+                    "{} guard reset after successful live order",
+                    venue_code(venue)
+                )));
+            }
+            return Ok(None);
+        }
+
+        let threshold = self.config.failure_threshold.max(1);
+        venue_state.consecutive_live_failures =
+            venue_state.consecutive_live_failures.saturating_add(1);
+        venue_state.updated_at = now;
+
+        if venue_state.consecutive_live_failures >= threshold {
+            let cooldown = self.config.cooldown_secs.max(5);
+            let open_until = now + Duration::seconds(cooldown);
+            let newly_open = venue_state
+                .breaker_open_until
+                .map(|existing| existing <= now)
+                .unwrap_or(true);
+            venue_state.breaker_open_until = Some(open_until);
+            if newly_open {
+                return Ok(Some(format!(
+                    "{} circuit breaker opened after {} failures (detail: {})",
+                    venue_code(venue),
+                    venue_state.consecutive_live_failures,
+                    detail
+                )));
+            }
+        }
+        Ok(None)
+    }
+
+    fn set_kill_switch(&self, enabled: bool, reason: Option<String>) -> Result<LiveGuardSnapshot> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("live guard lock poisoned"))?;
+        guard.kill_switch_enabled = enabled;
+        guard.kill_switch_reason = reason.and_then(normalize_reason);
+        guard.kill_switch_updated_at = Utc::now();
+        Ok(self.build_snapshot_locked(&guard, Utc::now()))
+    }
+
+    fn set_venue_controls(
+        &self,
+        venue: &Venue,
+        live_enabled: Option<bool>,
+        reset_breaker: bool,
+    ) -> Result<LiveGuardSnapshot> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("live guard lock poisoned"))?;
+        let Some(venue_state) = guard.venues.get_mut(venue) else {
+            return Err(anyhow!(
+                "live guard not configured for venue {}",
+                venue_code(venue)
+            ));
+        };
+        let mut changed = false;
+        if let Some(enabled) = live_enabled {
+            if venue_state.live_enabled != enabled {
+                venue_state.live_enabled = enabled;
+                changed = true;
+            }
+        }
+        if reset_breaker {
+            if venue_state.breaker_open_until.is_some() || venue_state.consecutive_live_failures > 0
+            {
+                venue_state.breaker_open_until = None;
+                venue_state.consecutive_live_failures = 0;
+                changed = true;
+            }
+        }
+        if changed {
+            venue_state.updated_at = Utc::now();
+        }
+        Ok(self.build_snapshot_locked(&guard, Utc::now()))
+    }
+
+    fn snapshot(&self) -> Result<LiveGuardSnapshot> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("live guard lock poisoned"))?;
+        Ok(self.build_snapshot_locked(&guard, Utc::now()))
+    }
+
+    fn build_snapshot_locked(
+        &self,
+        state: &LiveGuardState,
+        now: DateTime<Utc>,
+    ) -> LiveGuardSnapshot {
+        let mut venues: Vec<LiveGuardVenueView> = state
+            .venues
+            .iter()
+            .map(|(venue, venue_state)| {
+                let (live_allowed_now, block_reason) =
+                    self.venue_access_status_locked(state, venue, venue_state, now);
+                LiveGuardVenueView {
+                    venue: venue_code(venue),
+                    live_enabled: venue_state.live_enabled,
+                    live_allowed_now,
+                    block_reason,
+                    consecutive_live_failures: venue_state.consecutive_live_failures,
+                    breaker_open: venue_state
+                        .breaker_open_until
+                        .map(|until| until > now)
+                        .unwrap_or(false),
+                    breaker_open_until: venue_state.breaker_open_until,
+                    last_health_ok: venue_state.last_health.as_ref().map(|v| v.ok),
+                    last_health_detail: venue_state.last_health.as_ref().map(|v| v.detail.clone()),
+                    last_health_at: venue_state.last_health.as_ref().map(|v| v.checked_at),
+                    updated_at: venue_state.updated_at,
+                }
+            })
+            .collect();
+        venues.sort_by(|a, b| a.venue.cmp(&b.venue));
+
+        LiveGuardSnapshot {
+            config: LiveGuardConfigView {
+                require_healthy: self.config.require_healthy,
+                max_health_age_secs: self.config.max_health_age_secs,
+                failure_threshold: self.config.failure_threshold.max(1),
+                cooldown_secs: self.config.cooldown_secs.max(5),
+                health_poll_interval_secs: self.poll_interval_secs(),
+            },
+            global: LiveGuardGlobalView {
+                kill_switch_enabled: state.kill_switch_enabled,
+                kill_switch_reason: state.kill_switch_reason.clone(),
+                kill_switch_updated_at: state.kill_switch_updated_at,
+            },
+            venues,
+        }
+    }
+
+    fn venue_access_status_locked(
+        &self,
+        state: &LiveGuardState,
+        venue: &Venue,
+        venue_state: &VenueLiveGuardState,
+        now: DateTime<Utc>,
+    ) -> (bool, Option<String>) {
+        if state.kill_switch_enabled {
+            let reason = state
+                .kill_switch_reason
+                .clone()
+                .unwrap_or_else(|| "operator kill switch engaged".to_string());
+            return (false, Some(format!("global kill switch: {reason}")));
+        }
+
+        if !venue_state.live_enabled {
+            return (false, Some("venue disabled by operator policy".to_string()));
+        }
+
+        if let Some(until) = venue_state.breaker_open_until {
+            if until > now {
+                return (
+                    false,
+                    Some(format!("circuit breaker open until {}", until.to_rfc3339())),
+                );
+            }
+        }
+
+        if self.config.require_healthy {
+            match &venue_state.last_health {
+                Some(health) => {
+                    if !health.ok {
+                        return (
+                            false,
+                            Some(format!("health check failing: {}", health.detail)),
+                        );
+                    }
+                    let age_secs = now.signed_duration_since(health.checked_at).num_seconds();
+                    if age_secs > self.config.max_health_age_secs {
+                        return (
+                            false,
+                            Some(format!("health report stale ({}s old)", age_secs)),
+                        );
+                    }
+                }
+                None => {
+                    return (false, Some("no health report yet".to_string()));
+                }
+            }
+        }
+
+        let _ = venue;
+        (true, None)
+    }
+}
+
+fn normalize_reason(raw: String) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -242,6 +706,21 @@ struct ApiOrderInput {
 struct RecentOrdersQuery {
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LiveKillSwitchInput {
+    enabled: bool,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct VenueGuardControlInput {
+    #[serde(default)]
+    live_enabled: Option<bool>,
+    #[serde(default)]
+    reset_breaker: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -410,7 +889,11 @@ async fn main() -> Result<()> {
         .or_else(|_| {
             std::env::var("OMS_AUDIT_LOG_PATH")
                 .map(PathBuf::from)
-                .map(|p| p.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("var")))
+                .map(|p| {
+                    p.parent()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("var"))
+                })
         })
         .unwrap_or_else(|_| PathBuf::from("var/oms_audit"));
     let oms = OmsManager::new(
@@ -459,7 +942,9 @@ fn build_registry_from_env() -> Result<AdapterRegistry> {
         let adapter = KalshiAdapter::new(config).context("failed to initialize Kalshi adapter")?;
         registry.register(adapter);
     } else {
-        warn!("kalshi adapter not configured (missing KALSHI_API_KEY_ID or KALSHI_RSA_PRIVATE_KEY)");
+        warn!(
+            "kalshi adapter not configured (missing KALSHI_API_KEY_ID or KALSHI_RSA_PRIVATE_KEY)"
+        );
     }
 
     let ibkr_account_id = std::env::var("IBKR_ACCOUNT_ID").ok();
@@ -488,7 +973,8 @@ fn build_registry_from_env() -> Result<AdapterRegistry> {
             api_secret,
             passphrase,
         };
-        let adapter = CoinbaseAdapter::new(config).context("failed to initialize Coinbase adapter")?;
+        let adapter =
+            CoinbaseAdapter::new(config).context("failed to initialize Coinbase adapter")?;
         registry.register(adapter);
     } else {
         warn!("coinbase adapter not configured (missing API key/secret/passphrase)");
@@ -518,19 +1004,22 @@ fn build_auth_store_from_env() -> Result<AuthStore> {
             let user_id = uuid::Uuid::parse_str(parts[1])
                 .with_context(|| format!("invalid user_id in API_KEYS entry `{spec}`"))?;
 
-            let (org_id, role_idx, label_idx) = if parts.len() >= 4
-                && uuid::Uuid::parse_str(parts[2]).is_ok()
-            {
-                (
-                    uuid::Uuid::parse_str(parts[2]).unwrap_or(default_org_id),
-                    3usize,
-                    4usize,
-                )
-            } else {
-                (default_org_id, 2usize, 3usize)
-            };
+            let (org_id, role_idx, label_idx) =
+                if parts.len() >= 4 && uuid::Uuid::parse_str(parts[2]).is_ok() {
+                    (
+                        uuid::Uuid::parse_str(parts[2]).unwrap_or(default_org_id),
+                        3usize,
+                        4usize,
+                    )
+                } else {
+                    (default_org_id, 2usize, 3usize)
+                };
             let role = parse_role(parts[role_idx])?;
-            let label = parts.get(label_idx).copied().unwrap_or("api-user").to_string();
+            let label = parts
+                .get(label_idx)
+                .copied()
+                .unwrap_or("api-user")
+                .to_string();
 
             map.insert(
                 token,
@@ -622,13 +1111,15 @@ async fn run_health_checks(registry: &AdapterRegistry) -> Result<()> {
 }
 
 async fn run_demo_order(oms_manager: &OmsManager, default_mode: ExecutionMode) -> Result<()> {
-    let venue = parse_venue(std::env::var("DEMO_VENUE").unwrap_or_else(|_| "coinbase".to_string()))?;
+    let venue =
+        parse_venue(std::env::var("DEMO_VENUE").unwrap_or_else(|_| "coinbase".to_string()))?;
     let mode = std::env::var("EXECUTION_MODE")
         .ok()
         .map(parse_mode)
         .transpose()?
         .unwrap_or(default_mode);
-    let symbol = std::env::var("DEMO_SYMBOL").unwrap_or_else(|_| default_symbol(&venue).to_string());
+    let symbol =
+        std::env::var("DEMO_SYMBOL").unwrap_or_else(|_| default_symbol(&venue).to_string());
     let quantity = env_f64("DEMO_QTY", 1.0);
     let limit_price = Some(env_f64("DEMO_LIMIT_PRICE", 100.0));
 
@@ -672,6 +1163,50 @@ async fn run_demo_order(oms_manager: &OmsManager, default_mode: ExecutionMode) -
     Ok(())
 }
 
+fn spawn_live_guard_probe(
+    registry: AdapterRegistry,
+    live_guard: LiveExecutionGuard,
+    event_bus: EventBus,
+) {
+    let poll_secs = live_guard.poll_interval_secs();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(poll_secs));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            for adapter in registry.all() {
+                let venue = adapter.venue();
+                let (ok, detail, checked_at) = match adapter.health().await {
+                    Ok(report) => (report.ok, report.detail, report.checked_at),
+                    Err(err) => (false, format!("health probe error: {err}"), Utc::now()),
+                };
+
+                match live_guard.note_health(&venue, ok, detail.clone(), checked_at) {
+                    Ok(changed) => {
+                        if changed {
+                            if let Ok(snapshot) = live_guard.snapshot() {
+                                event_bus.publish(
+                                    "execution_guard",
+                                    serde_json::json!({
+                                        "event": "health_update",
+                                        "venue": venue_code(&venue),
+                                        "ok": ok,
+                                        "detail": detail,
+                                        "snapshot": snapshot
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        warn!(venue = %venue_code(&venue), error = %err, "failed to update live guard health");
+                    }
+                }
+            }
+        }
+    });
+}
+
 async fn serve_api(
     oms: OmsManager,
     auth: AuthStore,
@@ -684,26 +1219,42 @@ async fn serve_api(
         ));
     }
 
+    let live_guard = LiveExecutionGuard::new(oms.configured_venues(), LiveGuardConfig::from_env());
+    let event_bus = EventBus::new(env_u32("STREAM_EVENT_BUFFER", 512) as usize);
     let state = AppState {
         oms,
         auth,
         default_mode,
         db,
         rate_limiter: OrgRateLimiter::new(env_u32("ORG_RATE_LIMIT_PER_MIN", 600) as usize),
-        event_bus: EventBus::new(env_u32("STREAM_EVENT_BUFFER", 512) as usize),
+        live_guard: live_guard.clone(),
+        event_bus: event_bus.clone(),
     };
+    spawn_live_guard_probe(state.oms.adapter_registry(), live_guard, event_bus);
 
     let protected = Router::new()
         .route("/v1/orders", post(api_place_order))
         .route("/v1/portfolio", get(api_get_portfolio))
         .route("/v1/portfolio/history", get(api_portfolio_history))
         .route("/v1/orders/recent", get(api_recent_orders))
+        .route("/v1/execution/guards", get(api_get_live_guards))
+        .route(
+            "/v1/execution/guards/kill-switch",
+            post(api_set_live_kill_switch),
+        )
+        .route(
+            "/v1/execution/guards/venues/:venue",
+            post(api_set_venue_guard),
+        )
         .route("/v1/api-keys", post(api_create_api_key))
         .route("/v1/auth/change-password", post(api_auth_change_password))
         .route("/v1/auth/revoke", post(api_auth_revoke))
         .route("/v1/orgs", post(api_create_org))
         .route("/v1/users", get(api_list_users).post(api_create_user))
-        .route("/v1/users/:user_id/issue-reset", post(api_issue_password_reset))
+        .route(
+            "/v1/users/:user_id/issue-reset",
+            post(api_issue_password_reset),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -860,17 +1411,20 @@ async fn api_stream_events(
         payload: initial,
         at: Utc::now(),
     };
-    let initial_event_json = serde_json::to_string(&initial_event)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let initial_stream = tokio_stream::once(Ok(SseEvent::default().event("system").data(initial_event_json)));
+    let initial_event_json =
+        serde_json::to_string(&initial_event).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let initial_stream = tokio_stream::once(Ok(SseEvent::default()
+        .event("system")
+        .data(initial_event_json)));
 
-    let event_stream = BroadcastStream::new(state.event_bus.subscribe()).filter_map(|message| match message {
-        Ok(event) => match serde_json::to_string(&event) {
-            Ok(data) => Some(Ok(SseEvent::default().event(event.kind).data(data))),
+    let event_stream =
+        BroadcastStream::new(state.event_bus.subscribe()).filter_map(|message| match message {
+            Ok(event) => match serde_json::to_string(&event) {
+                Ok(data) => Some(Ok(SseEvent::default().event(event.kind).data(data))),
+                Err(_) => None,
+            },
             Err(_) => None,
-        },
-        Err(_) => None,
-    });
+        });
 
     let stream = initial_stream.chain(event_stream);
     Ok(Sse::new(stream).keep_alive(
@@ -902,6 +1456,11 @@ async fn api_place_order(
             StatusCode::FORBIDDEN,
             "only admin role can request live mode".to_string(),
         );
+    }
+    if matches!(requested_mode, ExecutionMode::Live) {
+        if let Err(reason) = state.live_guard.authorize_live(&venue, Utc::now()) {
+            return api_error(StatusCode::FORBIDDEN, reason);
+        }
     }
 
     let order = OrderRequest {
@@ -936,6 +1495,30 @@ async fn api_place_order(
 
     match oms.submit_order_with_audit(order).await {
         Ok((ack, record)) => {
+            if matches!(ack.mode, ExecutionMode::Live) {
+                let live_ok = matches!(ack.status, OrderStatus::Accepted);
+                match state
+                    .live_guard
+                    .record_live_result(&venue, live_ok, &ack.message)
+                {
+                    Ok(Some(guard_event)) => {
+                        if let Ok(snapshot) = state.live_guard.snapshot() {
+                            state.event_bus.publish(
+                                "execution_guard",
+                                serde_json::json!({
+                                    "event": if live_ok { "live_recovered" } else { "live_failure_guarded" },
+                                    "venue": venue_code(&venue),
+                                    "detail": guard_event,
+                                    "snapshot": snapshot
+                                }),
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => warn!(error = %err, "failed to update live guard after live ack"),
+                }
+            }
+
             let user_snapshot = state
                 .oms
                 .for_org(identity.org_id)
@@ -997,18 +1580,50 @@ async fn api_place_order(
                 );
             }
 
-            (StatusCode::OK, Json(serde_json::json!({
-                "ack": ack,
-                "actor": {
-                    "user_id": identity.user_id,
-                    "org_id": identity.org_id,
-                    "label": identity.label,
-                    "role": identity.role
-                }
-            })))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ack": ack,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "org_id": identity.org_id,
+                        "label": identity.label,
+                        "role": identity.role
+                    }
+                })),
+            )
                 .into_response()
         }
-        Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
+        Err(err) => {
+            if matches!(requested_mode, ExecutionMode::Live) && matches!(&err, OmsError::Adapter(_))
+            {
+                let err_detail = err.to_string();
+                match state
+                    .live_guard
+                    .record_live_result(&venue, false, &err_detail)
+                {
+                    Ok(Some(guard_event)) => {
+                        if let Ok(snapshot) = state.live_guard.snapshot() {
+                            state.event_bus.publish(
+                                "execution_guard",
+                                serde_json::json!({
+                                    "event": "live_failure_guarded",
+                                    "venue": venue_code(&venue),
+                                    "detail": guard_event,
+                                    "snapshot": snapshot
+                                }),
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(guard_err) => {
+                        warn!(error = %guard_err, "failed to update live guard after adapter error")
+                    }
+                }
+                return api_error(StatusCode::BAD_REQUEST, err_detail);
+            }
+            api_error(StatusCode::BAD_REQUEST, err.to_string())
+        }
     }
 }
 
@@ -1067,7 +1682,10 @@ async fn api_recent_orders(
     if let Some(db) = &state.db {
         match db.recent_order_audits(identity.org_id, limit).await {
             Ok(records) => {
-                return (StatusCode::OK, Json(serde_json::json!({ "records": records })))
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "records": records })),
+                )
                     .into_response();
             }
             Err(err) => {
@@ -1082,8 +1700,107 @@ async fn api_recent_orders(
     };
 
     match oms.recent_audit_records(limit) {
-        Ok(records) => (StatusCode::OK, Json(serde_json::json!({ "records": records }))).into_response(),
+        Ok(records) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "records": records })),
+        )
+            .into_response(),
         Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+async fn api_get_live_guards(State(state): State<AppState>) -> impl IntoResponse {
+    match state.live_guard.snapshot() {
+        Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+async fn api_set_live_kill_switch(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<LiveKillSwitchInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_request_live() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "only admin role can modify live guards".to_string(),
+        );
+    }
+
+    let reason = payload.reason.and_then(normalize_reason);
+    match state
+        .live_guard
+        .set_kill_switch(payload.enabled, reason.clone())
+    {
+        Ok(snapshot) => {
+            state.event_bus.publish(
+                "execution_guard",
+                serde_json::json!({
+                    "event": if payload.enabled { "kill_switch_engaged" } else { "kill_switch_released" },
+                    "reason": reason,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "label": identity.label,
+                        "role": role_code(&identity.role)
+                    },
+                    "snapshot": snapshot
+                }),
+            );
+            (StatusCode::OK, Json(snapshot)).into_response()
+        }
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+async fn api_set_venue_guard(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(raw_venue): Path<String>,
+    Json(payload): Json<VenueGuardControlInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_request_live() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "only admin role can modify live guards".to_string(),
+        );
+    }
+
+    let venue = match parse_venue(raw_venue) {
+        Ok(venue) => venue,
+        Err(err) => return api_error(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    let reset_breaker = payload.reset_breaker.unwrap_or(false);
+    if payload.live_enabled.is_none() && !reset_breaker {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "set live_enabled or reset_breaker=true".to_string(),
+        );
+    }
+
+    match state
+        .live_guard
+        .set_venue_controls(&venue, payload.live_enabled, reset_breaker)
+    {
+        Ok(snapshot) => {
+            state.event_bus.publish(
+                "execution_guard",
+                serde_json::json!({
+                    "event": "venue_guard_updated",
+                    "venue": venue_code(&venue),
+                    "live_enabled": payload.live_enabled,
+                    "reset_breaker": reset_breaker,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "label": identity.label,
+                        "role": role_code(&identity.role)
+                    },
+                    "snapshot": snapshot
+                }),
+            );
+            (StatusCode::OK, Json(snapshot)).into_response()
+        }
+        Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
 
@@ -1103,7 +1820,11 @@ async fn api_portfolio_history(
         .portfolio_snapshots(identity.org_id, identity.user_id, limit)
         .await
     {
-        Ok(rows) => (StatusCode::OK, Json(serde_json::json!({ "snapshots": rows }))).into_response(),
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "snapshots": rows })),
+        )
+            .into_response(),
         Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
 }
@@ -1162,7 +1883,12 @@ async fn api_auth_login(
     let refresh_token = generate_refresh_token();
     let refresh_expires_at = Utc::now() + Duration::seconds(refresh_ttl.max(60));
     if let Err(err) = db
-        .store_refresh_token(user.org_id, user.user_id, &refresh_token, refresh_expires_at)
+        .store_refresh_token(
+            user.org_id,
+            user.user_id,
+            &refresh_token,
+            refresh_expires_at,
+        )
         .await
     {
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
@@ -1202,12 +1928,20 @@ async fn api_auth_refresh(
         Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
     let Some((org_id, user_id)) = consumed else {
-        return api_error(StatusCode::UNAUTHORIZED, "invalid refresh token".to_string());
+        return api_error(
+            StatusCode::UNAUTHORIZED,
+            "invalid refresh token".to_string(),
+        );
     };
 
     let user = match db.find_user_by_id(user_id).await {
         Ok(Some(u)) => u,
-        Ok(None) => return api_error(StatusCode::UNAUTHORIZED, "invalid refresh token".to_string()),
+        Ok(None) => {
+            return api_error(
+                StatusCode::UNAUTHORIZED,
+                "invalid refresh token".to_string(),
+            )
+        }
         Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     };
     if !user.active {
@@ -1289,7 +2023,12 @@ async fn api_auth_change_password(
     }
 
     if let Err(err) = db
-        .set_user_password(identity.org_id, identity.user_id, &payload.new_password, false)
+        .set_user_password(
+            identity.org_id,
+            identity.user_id,
+            &payload.new_password,
+            false,
+        )
         .await
     {
         return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
@@ -1378,7 +2117,10 @@ async fn api_auth_revoke(
                 "admin role required to revoke tokens for another user".to_string(),
             );
         }
-        let revoked_count = match db.revoke_all_refresh_tokens(identity.org_id, target_user).await {
+        let revoked_count = match db
+            .revoke_all_refresh_tokens(identity.org_id, target_user)
+            .await
+        {
             Ok(count) => count,
             Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
         };
@@ -1661,8 +2403,8 @@ impl PgStore {
         let org_id = upsert_org(&self.pool, &org_name).await?;
         let user_id = upsert_user(&self.pool, org_id, &admin_email, "admin").await?;
         if let Some(password) = admin_password {
-            let password_hash = make_password_hash(&password)
-                .context("failed to hash bootstrap admin password")?;
+            let password_hash =
+                make_password_hash(&password).context("failed to hash bootstrap admin password")?;
             sqlx::query(
                 "UPDATE users SET password_hash = $1, active = TRUE, must_reset_password = FALSE WHERE id = $2",
             )
@@ -1939,7 +2681,10 @@ impl PgStore {
         Ok(())
     }
 
-    async fn consume_refresh_token(&self, raw_token: &str) -> Result<Option<(uuid::Uuid, uuid::Uuid)>> {
+    async fn consume_refresh_token(
+        &self,
+        raw_token: &str,
+    ) -> Result<Option<(uuid::Uuid, uuid::Uuid)>> {
         let row = sqlx::query(
             r#"
             UPDATE refresh_tokens
@@ -1991,7 +2736,11 @@ impl PgStore {
         Ok(row.is_some())
     }
 
-    async fn revoke_all_refresh_tokens(&self, org_id: uuid::Uuid, user_id: uuid::Uuid) -> Result<u64> {
+    async fn revoke_all_refresh_tokens(
+        &self,
+        org_id: uuid::Uuid,
+        user_id: uuid::Uuid,
+    ) -> Result<u64> {
         let result = sqlx::query(
             r#"
             UPDATE refresh_tokens
@@ -2023,7 +2772,9 @@ impl PgStore {
             .context("failed to validate user for password reset")?
             .is_some();
         if !user_exists {
-            return Err(anyhow!("target user does not exist in org for password reset"));
+            return Err(anyhow!(
+                "target user does not exist in org for password reset"
+            ));
         }
 
         let token = format!(
@@ -2047,14 +2798,12 @@ impl PgStore {
         .await
         .context("failed to create password reset token")?;
 
-        sqlx::query(
-            "UPDATE users SET must_reset_password = TRUE WHERE id = $1 AND org_id = $2",
-        )
-        .bind(user_id)
-        .bind(org_id)
-        .execute(&self.pool)
-        .await
-        .context("failed to mark user as requiring password reset")?;
+        sqlx::query("UPDATE users SET must_reset_password = TRUE WHERE id = $1 AND org_id = $2")
+            .bind(user_id)
+            .bind(org_id)
+            .execute(&self.pool)
+            .await
+            .context("failed to mark user as requiring password reset")?;
         Ok(token)
     }
 
@@ -2254,7 +3003,8 @@ async fn upsert_user(
     .fetch_one(pool)
     .await
     .context("failed to upsert user")?;
-    row.try_get("id").context("missing user id in upsert result")
+    row.try_get("id")
+        .context("missing user id in upsert result")
 }
 
 fn map_auth_user(row: sqlx::postgres::PgRow) -> Result<AuthUser> {
@@ -2405,7 +3155,9 @@ fn parse_role(raw: &str) -> Result<Role> {
         "admin" => Ok(Role::Admin),
         "trader" => Ok(Role::Trader),
         "viewer" => Ok(Role::Viewer),
-        _ => Err(anyhow!("invalid API role `{raw}` (expected admin|trader|viewer)")),
+        _ => Err(anyhow!(
+            "invalid API role `{raw}` (expected admin|trader|viewer)"
+        )),
     }
 }
 
@@ -2502,6 +3254,19 @@ fn env_bool(key: &str, default: bool) -> bool {
             _ => None,
         })
         .unwrap_or(default)
+}
+
+fn env_csv_lower(key: &str) -> HashSet<String> {
+    std::env::var(key)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(|part| part.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn env_f64(key: &str, default: f64) -> f64 {

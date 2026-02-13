@@ -276,6 +276,10 @@ body {
   font-size: 0.8rem;
 }
 
+.danger-text {
+  color: var(--danger);
+}
+
 .field-label {
   display: block;
   margin-bottom: 6px;
@@ -332,8 +336,20 @@ select.field {
   font-weight: 700;
 }
 
+.button.danger {
+  background: linear-gradient(130deg, color-mix(in srgb, var(--danger), black 16%), var(--danger));
+  color: #fff4f6;
+  border-color: transparent;
+  font-weight: 700;
+}
+
 .button.ghost {
   background: rgba(255, 255, 255, 0.04);
+}
+
+.button.tiny {
+  padding: 6px 10px;
+  font-size: 0.72rem;
 }
 
 .button:disabled {
@@ -359,6 +375,36 @@ select.field {
 
 .metric-list strong {
   color: var(--text);
+}
+
+.guard-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.guard-venue-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.guard-venue-row {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  display: flex;
+  gap: var(--space-3);
+  justify-content: space-between;
+  align-items: flex-start;
+}
+
+.guard-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  justify-content: flex-end;
+  align-items: center;
 }
 
 .pill {

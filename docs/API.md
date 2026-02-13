@@ -27,6 +27,9 @@ Roles:
 - `GET /v1/portfolio`
 - `GET /v1/portfolio/history?limit=100`
 - `GET /v1/orders/recent?limit=50`
+- `GET /v1/execution/guards` (protected)
+- `POST /v1/execution/guards/kill-switch` (admin only)
+- `POST /v1/execution/guards/venues/:venue` (admin only)
 - `POST /v1/auth/change-password` (protected)
 - `POST /v1/auth/revoke` (protected)
 - `POST /v1/api-keys` (admin only, DB required)
@@ -39,6 +42,7 @@ SSE event types currently emitted:
 - `system` (connection/auth metadata)
 - `order_ack` (new order acknowledgment)
 - `portfolio_snapshot` (post-trade portfolio update)
+- `execution_guard` (kill-switch/venue-guard/health updates)
 
 ## Example Request
 
@@ -119,6 +123,13 @@ cargo run -p trading-server -- db-migrate
   - `ORG_RATE_LIMIT_PER_MIN`
   - `PASSWORD_RESET_TOKEN_TTL_SECS`
   - `STREAM_EVENT_BUFFER`
+- Live guard hardening:
+  - `LIVE_GUARD_REQUIRE_HEALTHY`
+  - `LIVE_GUARD_HEALTH_MAX_AGE_SECS`
+  - `LIVE_GUARD_HEALTH_POLL_SECS`
+  - `LIVE_GUARD_FAILURE_THRESHOLD`
+  - `LIVE_GUARD_COOLDOWN_SECS`
+  - `LIVE_GUARD_DISABLED_VENUES`
 
 ## Password Reset Flow
 

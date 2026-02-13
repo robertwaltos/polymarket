@@ -5,6 +5,8 @@ import type {
   AuthLoginResponse,
   ExecutionMode,
   HealthResponse,
+  LiveGuardSnapshot,
+  LiveGuardVenueState,
   PlaceOrderInput,
   PortfolioHistorySnapshot,
   PortfolioResponse,
@@ -48,6 +50,7 @@ export default function App() {
   });
   const [baseUrl, setBaseUrl] = useState<string>(() => localStorage.getItem(BASE_URL_STORAGE_KEY) ?? defaultApiBaseUrl());
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [liveGuards, setLiveGuards] = useState<LiveGuardSnapshot | null>(null);
   const [portfolio, setPortfolio] = useState<PortfolioResponse | null>(null);
   const [history, setHistory] = useState<PortfolioHistorySnapshot[]>([]);
   const [orders, setOrders] = useState<RecentOrderRecord[]>([]);
@@ -66,7 +69,9 @@ export default function App() {
   });
   const [orderDraft, setOrderDraft] = useState(defaultOrderDraft);
   const [busy, setBusy] = useState(false);
+  const [guardBusy, setGuardBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [killSwitchReason, setKillSwitchReason] = useState("");
   const [activity, setActivity] = useState<ActivityItem[]>([]);
   const [streamStatus, setStreamStatus] = useState<"idle" | "connecting" | "live" | "error">("idle");
 
@@ -102,6 +107,7 @@ export default function App() {
       setPortfolio(null);
       setHistory([]);
       setOrders([]);
+      setLiveGuards(null);
       setStreamStatus("idle");
       return;
     }
@@ -136,14 +142,16 @@ export default function App() {
 
     const refreshFromStream = async () => {
       try {
-        const [portfolioData, historyData, ordersData] = await Promise.all([
+        const [portfolioData, historyData, ordersData, guardsData] = await Promise.all([
           api.portfolio(),
           api.portfolioHistory(40),
-          api.recentOrders(25)
+          api.recentOrders(25),
+          api.liveGuards()
         ]);
         setPortfolio(portfolioData);
         setHistory(historyData.snapshots);
         setOrders(ordersData.records);
+        setLiveGuards(guardsData);
       } catch {
         // polling loop continues as fallback
       }
@@ -167,6 +175,11 @@ export default function App() {
 
     source.addEventListener("portfolio_snapshot", () => {
       pushActivity("info", "Realtime portfolio snapshot received.");
+      void refreshFromStream();
+    });
+
+    source.addEventListener("execution_guard", () => {
+      pushActivity("warn", "Execution guard state changed.");
       void refreshFromStream();
     });
 
@@ -204,6 +217,9 @@ export default function App() {
   );
   const unrealizedPnl = activePositions.reduce((sum, position) => sum + (position.unrealized_pnl || 0), 0);
   const sparklinePoints = useMemo(() => buildSparklinePoints(history, cashValue), [history, cashValue]);
+  const selectedVenueGuard = liveGuards?.venues.find((entry) => entry.venue === orderDraft.venue);
+  const liveBlockedReason =
+    orderDraft.mode === "live" ? currentLiveBlockReason(liveGuards, selectedVenueGuard) : null;
 
   async function loadHealth() {
     try {
@@ -218,14 +234,16 @@ export default function App() {
   async function loadProtectedData() {
     if (!session) return;
     try {
-      const [portfolioData, historyData, ordersData] = await Promise.all([
+      const [portfolioData, historyData, ordersData, guardData] = await Promise.all([
         api.portfolio(),
         api.portfolioHistory(40),
-        api.recentOrders(25)
+        api.recentOrders(25),
+        api.liveGuards()
       ]);
       setPortfolio(portfolioData);
       setHistory(historyData.snapshots);
       setOrders(ordersData.records);
+      setLiveGuards(guardData);
       setError(null);
     } catch (err) {
       const message = errorMessage(err);
@@ -286,10 +304,69 @@ export default function App() {
     }
   }
 
+  async function handleKillSwitchToggle(enabled: boolean) {
+    if (!session) {
+      setError("Login required to control kill switch.");
+      return;
+    }
+    setGuardBusy(true);
+    try {
+      const payload = {
+        enabled,
+        reason: enabled ? killSwitchReason.trim() || undefined : undefined
+      };
+      const snapshot = await api.setLiveKillSwitch(payload);
+      setLiveGuards(snapshot);
+      setError(null);
+      appendActivity(enabled ? "warn" : "info", enabled ? "Global kill switch engaged." : "Global kill switch released.");
+    } catch (err) {
+      const message = errorMessage(err);
+      setError(message);
+      appendActivity("error", `Kill switch update failed: ${message}`);
+    } finally {
+      setGuardBusy(false);
+    }
+  }
+
+  async function handleVenueGuardControl(
+    venue: LiveGuardVenueState["venue"],
+    liveEnabled?: boolean,
+    resetBreaker = false
+  ) {
+    if (!session) {
+      setError("Login required to control venue guards.");
+      return;
+    }
+    setGuardBusy(true);
+    try {
+      const snapshot = await api.setVenueGuard(venue, {
+        live_enabled: liveEnabled,
+        reset_breaker: resetBreaker
+      });
+      setLiveGuards(snapshot);
+      setError(null);
+      const action = resetBreaker
+        ? `${venue.toUpperCase()} breaker reset.`
+        : `${venue.toUpperCase()} live ${liveEnabled ? "enabled" : "disabled"}.`;
+      appendActivity("warn", action);
+    } catch (err) {
+      const message = errorMessage(err);
+      setError(message);
+      appendActivity("error", `Venue guard update failed: ${message}`);
+    } finally {
+      setGuardBusy(false);
+    }
+  }
+
   async function handleSubmitOrder(event: FormEvent) {
     event.preventDefault();
     if (!session) {
       setError("Login required to submit orders.");
+      return;
+    }
+    if (liveBlockedReason) {
+      setError(liveBlockedReason);
+      appendActivity("warn", `Live order blocked: ${liveBlockedReason}`);
       return;
     }
     const quantity = Number(orderDraft.quantity);
@@ -427,6 +504,85 @@ export default function App() {
             </li>
           </ul>
         </div>
+
+        <div className="panel compact guard-panel">
+          <div className="panel-header">
+            <h2 className="panel-title">Live Execution Guards</h2>
+            <span className={`pill ${liveGuards?.global.kill_switch_enabled ? "danger" : "good"}`}>
+              {liveGuards?.global.kill_switch_enabled ? "Kill ON" : "Kill OFF"}
+            </span>
+          </div>
+          {!session ? (
+            <p className="hint">Sign in to view and manage venue execution guards.</p>
+          ) : (
+            <>
+              <label className="field-label" htmlFor="kill-switch-reason">
+                Kill Switch Reason
+              </label>
+              <input
+                id="kill-switch-reason"
+                className="field"
+                value={killSwitchReason}
+                onChange={(event) => setKillSwitchReason(event.target.value)}
+                placeholder="Manual halt reason"
+              />
+              <div className="split two">
+                <button
+                  className="button danger"
+                  type="button"
+                  onClick={() => void handleKillSwitchToggle(true)}
+                  disabled={guardBusy}
+                >
+                  Engage Kill
+                </button>
+                <button
+                  className="button ghost"
+                  type="button"
+                  onClick={() => void handleKillSwitchToggle(false)}
+                  disabled={guardBusy}
+                >
+                  Release
+                </button>
+              </div>
+              <div className="guard-venue-list">
+                {liveGuards?.venues.map((venueState) => (
+                  <div className="guard-venue-row" key={venueState.venue}>
+                    <div>
+                      <strong>{venueState.venue.toUpperCase()}</strong>
+                      <p className={`hint ${venueState.live_allowed_now ? "" : "danger-text"}`}>
+                        {venueState.block_reason ?? "Live route open"}
+                      </p>
+                    </div>
+                    <div className="guard-actions">
+                      <span className={`pill small ${venueState.live_allowed_now ? "good" : "danger"}`}>
+                        {venueState.live_allowed_now ? "open" : "blocked"}
+                      </span>
+                      <button
+                        className="button tiny ghost"
+                        type="button"
+                        onClick={() =>
+                          void handleVenueGuardControl(venueState.venue, !venueState.live_enabled, false)
+                        }
+                        disabled={guardBusy}
+                      >
+                        {venueState.live_enabled ? "Disable" : "Enable"}
+                      </button>
+                      <button
+                        className="button tiny ghost"
+                        type="button"
+                        onClick={() => void handleVenueGuardControl(venueState.venue, undefined, true)}
+                        disabled={guardBusy || (!venueState.breaker_open && venueState.consecutive_live_failures === 0)}
+                      >
+                        Reset
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {!liveGuards && <p className="hint">Loading guard state...</p>}
+              </div>
+            </>
+          )}
+        </div>
       </aside>
 
       <main className="main-stage">
@@ -434,6 +590,9 @@ export default function App() {
           <div className="status-row">
             <span className={`pill ${health?.ok ? "good" : "warn"}`}>{health?.ok ? "Connected" : "Disconnected"}</span>
             <span className="pill neutral">Env: {health?.execution_mode_default ?? "unknown"}</span>
+            <span className={`pill ${liveGuards?.global.kill_switch_enabled ? "danger" : "good"}`}>
+              Kill: {liveGuards?.global.kill_switch_enabled ? "ENGAGED" : "OFF"}
+            </span>
             <span className={`pill ${streamStatusTone(streamStatus)}`}>Stream: {streamStatus}</span>
             {error && <span className="pill danger">Issue: {error}</span>}
           </div>
@@ -621,7 +780,8 @@ export default function App() {
                   />
                 </label>
               )}
-              <button type="submit" className="button primary" disabled={busy || !session}>
+              {liveBlockedReason && <p className="hint danger-text">Live blocked: {liveBlockedReason}</p>}
+              <button type="submit" className="button primary" disabled={busy || guardBusy || !session || Boolean(liveBlockedReason)}>
                 {busy ? "Submitting..." : "Submit Order"}
               </button>
             </form>
@@ -728,6 +888,21 @@ function parseStreamEnvelope(raw: string): unknown {
   } catch {
     return null;
   }
+}
+
+function currentLiveBlockReason(
+  snapshot: LiveGuardSnapshot | null,
+  venueState: LiveGuardVenueState | undefined
+): string | null {
+  if (!snapshot) return "live guard state unavailable";
+  if (snapshot.global.kill_switch_enabled) {
+    return snapshot.global.kill_switch_reason || "global kill switch engaged";
+  }
+  if (!venueState) return "venue guard unavailable";
+  if (!venueState.live_allowed_now) {
+    return venueState.block_reason || "venue blocked by guard policy";
+  }
+  return null;
 }
 
 function statusTone(status: string): "good" | "warn" | "danger" | "neutral" {
