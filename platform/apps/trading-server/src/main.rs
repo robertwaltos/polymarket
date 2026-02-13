@@ -1,3 +1,6 @@
+mod intel;
+mod orchestrator;
+
 use anyhow::{anyhow, Context, Result};
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
@@ -17,7 +20,11 @@ use domain::{
 };
 use dotenvy::dotenv;
 use hmac::{Hmac, Mac};
+use intel::{ManualClaimInput, SocialClaim, SocialScanRequest, SocialSource};
 use oms::{JsonlAuditStore, OmsConfig, OmsEngine, OmsError, OrderAuditRecord};
+use orchestrator::{
+    OrchestratorConfig, StrategyOrchestrator, StrategyPerformanceInput, UpsertStrategyAgentInput,
+};
 use portfolio::PortfolioState;
 use risk::{RiskEngine, RiskLimits};
 use serde::{Deserialize, Serialize};
@@ -49,6 +56,8 @@ struct AppState {
     db: Option<Arc<PgStore>>,
     rate_limiter: OrgRateLimiter,
     live_guard: LiveExecutionGuard,
+    intel: intel::SocialIntelStore,
+    orchestrator: StrategyOrchestrator,
     event_bus: EventBus,
 }
 
@@ -196,6 +205,27 @@ impl LiveGuardConfig {
             failure_threshold: env_u32("LIVE_GUARD_FAILURE_THRESHOLD", 3),
             cooldown_secs: env_i64("LIVE_GUARD_COOLDOWN_SECS", 120),
             require_healthy: env_bool("LIVE_GUARD_REQUIRE_HEALTHY", true),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AutomationConfig {
+    enabled: bool,
+    interval_secs: u64,
+    lookback_days: i64,
+    max_per_query: usize,
+    use_intel_signals: bool,
+}
+
+impl AutomationConfig {
+    fn from_env() -> Self {
+        Self {
+            enabled: env_bool("AUTO_IMPROVE_ENABLED", false),
+            interval_secs: env_u64("AUTO_IMPROVE_INTERVAL_SECS", 900).max(30),
+            lookback_days: env_i64("AUTO_IMPROVE_LOOKBACK_DAYS", 4).clamp(1, 14),
+            max_per_query: env_u64("AUTO_IMPROVE_MAX_PER_QUERY", 20) as usize,
+            use_intel_signals: env_bool("AUTO_IMPROVE_USE_INTEL_SIGNALS", true),
         }
     }
 }
@@ -724,6 +754,28 @@ struct VenueGuardControlInput {
 }
 
 #[derive(Debug, Deserialize)]
+struct IntelClaimsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntelTagsQuery {
+    #[serde(default)]
+    window_hours: Option<i64>,
+    #[serde(default)]
+    top_n: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestratorEvaluateInput {
+    #[serde(default)]
+    use_intel_signals: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateApiKeyInput {
     label: String,
     role: Role,
@@ -867,10 +919,9 @@ async fn main() -> Result<()> {
     }
 
     let registry = build_registry_from_env()?;
-    if registry.all().is_empty() {
-        return Err(anyhow!(
-            "no adapters configured. set Kalshi, IBKR, or Coinbase env variables first"
-        ));
+    let has_adapters = !registry.all().is_empty();
+    if !has_adapters {
+        warn!("no venue adapters configured; serve mode will run with trading disabled");
     }
 
     let db = init_db_from_env().await?;
@@ -909,9 +960,28 @@ async fn main() -> Result<()> {
     );
 
     match command.as_str() {
-        "health" => run_health_checks(&registry).await,
-        "demo-order" => run_demo_order(&oms, default_mode).await,
+        "health" => {
+            if !has_adapters {
+                return Err(anyhow!(
+                    "no adapters configured. set Kalshi, IBKR, or Coinbase env variables first"
+                ));
+            }
+            run_health_checks(&registry).await
+        }
+        "demo-order" => {
+            if !has_adapters {
+                return Err(anyhow!(
+                    "no adapters configured. set Kalshi, IBKR, or Coinbase env variables first"
+                ));
+            }
+            run_demo_order(&oms, default_mode).await
+        }
         "run-once" => {
+            if !has_adapters {
+                return Err(anyhow!(
+                    "no adapters configured. set Kalshi, IBKR, or Coinbase env variables first"
+                ));
+            }
             run_health_checks(&registry).await?;
             run_demo_order(&oms, default_mode).await
         }
@@ -1207,6 +1277,131 @@ fn spawn_live_guard_probe(
     });
 }
 
+async fn persist_claims_if_db(
+    db: Option<&Arc<PgStore>>,
+    org_id: uuid::Uuid,
+    claims: &[SocialClaim],
+) -> Result<()> {
+    let Some(db) = db else {
+        return Ok(());
+    };
+    if claims.is_empty() {
+        return Ok(());
+    }
+    db.upsert_social_claims(org_id, claims).await
+}
+
+async fn persist_orchestrator_if_db(
+    db: Option<&Arc<PgStore>>,
+    org_id: uuid::Uuid,
+    snapshot: &orchestrator::OrchestratorSnapshot,
+) -> Result<()> {
+    let Some(db) = db else {
+        return Ok(());
+    };
+    db.upsert_orchestrator_snapshot(org_id, snapshot).await
+}
+
+async fn hydrate_automation_state(state: &AppState) -> Result<()> {
+    let Some(db) = &state.db else {
+        return Ok(());
+    };
+    let org_id = state.auth.default_org_id;
+    if let Ok(claims) = db.recent_social_claims(org_id, 2_000).await {
+        let _ = state.intel.replace_claims(claims);
+    }
+    if let Ok(Some(snapshot)) = db.latest_orchestrator_snapshot(org_id).await {
+        let _ = state.orchestrator.load_snapshot(snapshot);
+    }
+    Ok(())
+}
+
+fn spawn_auto_improvement_loop(state: AppState, config: AutomationConfig) {
+    if !config.enabled {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(config.interval_secs));
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let scan_request = SocialScanRequest {
+                sources: None,
+                queries: None,
+                lookback_days: Some(config.lookback_days),
+                max_per_query: Some(config.max_per_query),
+            };
+            let outcome = match state.intel.run_scan(scan_request).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    warn!(error = %err, "auto-improve scan step failed");
+                    continue;
+                }
+            };
+
+            if let Err(err) = persist_claims_if_db(
+                state.db.as_ref(),
+                state.auth.default_org_id,
+                &outcome.inserted_claims,
+            )
+            .await
+            {
+                warn!(error = %err, "failed persisting auto scan claims");
+            }
+
+            state.event_bus.publish(
+                "social_intel",
+                serde_json::json!({
+                    "event": "auto_scan_completed",
+                    "inserted": outcome.result.inserted,
+                    "total_claims": outcome.result.total_claims,
+                    "source_status": outcome.result.source_status,
+                    "top_tags": outcome.result.top_tags
+                }),
+            );
+
+            let tag_weights = if config.use_intel_signals {
+                match state.intel.tag_weights(24) {
+                    Ok(weights) => weights,
+                    Err(err) => {
+                        warn!(error = %err, "auto-improve could not compute tag weights");
+                        HashMap::new()
+                    }
+                }
+            } else {
+                HashMap::new()
+            };
+
+            match state.orchestrator.evaluate(tag_weights.clone()) {
+                Ok(snapshot) => {
+                    if let Err(err) = persist_orchestrator_if_db(
+                        state.db.as_ref(),
+                        state.auth.default_org_id,
+                        &snapshot,
+                    )
+                    .await
+                    {
+                        warn!(error = %err, "failed persisting auto orchestrator snapshot");
+                    }
+                    state.event_bus.publish(
+                        "strategy_orchestrator",
+                        serde_json::json!({
+                            "event": "auto_evaluation_completed",
+                            "use_intel_signals": config.use_intel_signals,
+                            "tag_weight_count": tag_weights.len(),
+                            "snapshot": snapshot
+                        }),
+                    );
+                }
+                Err(err) => {
+                    warn!(error = %err, "auto-improve evaluation step failed");
+                }
+            }
+        }
+    });
+}
+
 async fn serve_api(
     oms: OmsManager,
     auth: AuthStore,
@@ -1220,6 +1415,8 @@ async fn serve_api(
     }
 
     let live_guard = LiveExecutionGuard::new(oms.configured_venues(), LiveGuardConfig::from_env());
+    let intel = intel::SocialIntelStore::new_from_env();
+    let orchestrator = StrategyOrchestrator::new(OrchestratorConfig::from_env());
     let event_bus = EventBus::new(env_u32("STREAM_EVENT_BUFFER", 512) as usize);
     let state = AppState {
         oms,
@@ -1228,15 +1425,34 @@ async fn serve_api(
         db,
         rate_limiter: OrgRateLimiter::new(env_u32("ORG_RATE_LIMIT_PER_MIN", 600) as usize),
         live_guard: live_guard.clone(),
+        intel,
+        orchestrator,
         event_bus: event_bus.clone(),
     };
+    if let Err(err) = hydrate_automation_state(&state).await {
+        warn!(error = %err, "failed to hydrate social intel/orchestrator state");
+    }
     spawn_live_guard_probe(state.oms.adapter_registry(), live_guard, event_bus);
+    spawn_auto_improvement_loop(state.clone(), AutomationConfig::from_env());
 
     let protected = Router::new()
         .route("/v1/orders", post(api_place_order))
         .route("/v1/portfolio", get(api_get_portfolio))
         .route("/v1/portfolio/history", get(api_portfolio_history))
         .route("/v1/orders/recent", get(api_recent_orders))
+        .route(
+            "/v1/intel/claims",
+            get(api_get_intel_claims).post(api_add_intel_claim),
+        )
+        .route("/v1/intel/scan", post(api_run_intel_scan))
+        .route("/v1/intel/tags", get(api_get_intel_tags))
+        .route("/v1/orchestrator", get(api_get_orchestrator))
+        .route("/v1/orchestrator/agents", post(api_upsert_strategy_agent))
+        .route(
+            "/v1/orchestrator/agents/:agent_id/performance",
+            post(api_set_strategy_performance),
+        )
+        .route("/v1/orchestrator/evaluate", post(api_evaluate_orchestrator))
         .route("/v1/execution/guards", get(api_get_live_guards))
         .route(
             "/v1/execution/guards/kill-switch",
@@ -1363,12 +1579,20 @@ async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
         .and_then(|oms| oms.recent_audit_records(1).ok())
         .map(|v| v.len())
         .unwrap_or(0usize);
+    let intel_claims = state.intel.claim_count().unwrap_or(0usize);
+    let orchestrator_agents = state
+        .orchestrator
+        .snapshot()
+        .map(|snapshot| snapshot.agents.len())
+        .unwrap_or(0usize);
     Json(serde_json::json!({
         "ok": true,
         "timestamp": Utc::now(),
         "execution_mode_default": state.default_mode,
         "audit_recent_count": recent_count,
-        "db_enabled": state.db.is_some()
+        "db_enabled": state.db.is_some(),
+        "intel_claims": intel_claims,
+        "orchestrator_agents": orchestrator_agents
     }))
 }
 
@@ -1706,6 +1930,298 @@ async fn api_recent_orders(
         )
             .into_response(),
         Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+async fn api_get_intel_claims(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Query(query): Query<IntelClaimsQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(80).clamp(1, 500);
+    let source = match query.source {
+        Some(raw) => match parse_social_source(raw) {
+            Ok(source) => Some(source),
+            Err(err) => return api_error(StatusCode::BAD_REQUEST, err.to_string()),
+        },
+        None => None,
+    };
+    if let Some(db) = &state.db {
+        match db
+            .recent_social_claims(identity.org_id, limit)
+            .await
+            .map(|claims| match source {
+                Some(ref target) => claims
+                    .into_iter()
+                    .filter(|claim| &claim.source == target)
+                    .collect::<Vec<_>>(),
+                None => claims,
+            }) {
+            Ok(claims) => {
+                return (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "claims": claims })),
+                )
+                    .into_response()
+            }
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    }
+    match state.intel.list_claims(limit, source) {
+        Ok(claims) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "claims": claims })),
+        )
+            .into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+async fn api_add_intel_claim(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<ManualClaimInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow ingesting intelligence claims".to_string(),
+        );
+    }
+    match state.intel.ingest_manual_claim(payload) {
+        Ok(claim) => {
+            if let Err(err) =
+                persist_claims_if_db(state.db.as_ref(), identity.org_id, &[claim.clone()]).await
+            {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+            }
+            state.event_bus.publish(
+                "social_intel",
+                serde_json::json!({
+                    "event": "claim_ingested",
+                    "source": claim.source.code(),
+                    "claim_id": claim.id,
+                    "tags": claim.strategy_tags,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "label": identity.label,
+                        "role": role_code(&identity.role)
+                    }
+                }),
+            );
+            (StatusCode::OK, Json(claim)).into_response()
+        }
+        Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+async fn api_run_intel_scan(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<SocialScanRequest>,
+) -> impl IntoResponse {
+    if !identity.role.can_request_live() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "only admin role can trigger social intel scan".to_string(),
+        );
+    }
+    match state.intel.run_scan(payload).await {
+        Ok(outcome) => {
+            if let Err(err) =
+                persist_claims_if_db(state.db.as_ref(), identity.org_id, &outcome.inserted_claims)
+                    .await
+            {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+            }
+            state.event_bus.publish(
+                "social_intel",
+                serde_json::json!({
+                    "event": "scan_completed",
+                    "inserted": outcome.result.inserted,
+                    "total_claims": outcome.result.total_claims,
+                    "source_status": outcome.result.source_status,
+                    "top_tags": outcome.result.top_tags,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "label": identity.label,
+                        "role": role_code(&identity.role)
+                    }
+                }),
+            );
+            (StatusCode::OK, Json(outcome.result)).into_response()
+        }
+        Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+async fn api_get_intel_tags(
+    State(state): State<AppState>,
+    Query(query): Query<IntelTagsQuery>,
+) -> impl IntoResponse {
+    let window_hours = query.window_hours.unwrap_or(24).clamp(1, 24 * 30);
+    let top_n = query.top_n.unwrap_or(20).clamp(1, 100);
+    match state.intel.tag_signals(window_hours, top_n) {
+        Ok(tags) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "window_hours": window_hours,
+                "tags": tags
+            })),
+        )
+            .into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+async fn api_get_orchestrator(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+) -> impl IntoResponse {
+    if let Some(db) = &state.db {
+        match db.latest_orchestrator_snapshot(identity.org_id).await {
+            Ok(Some(snapshot)) => return (StatusCode::OK, Json(snapshot)).into_response(),
+            Ok(None) => {}
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    }
+    match state.orchestrator.snapshot() {
+        Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+async fn api_upsert_strategy_agent(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<UpsertStrategyAgentInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_request_live() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "only admin role can modify strategy agents".to_string(),
+        );
+    }
+    match state.orchestrator.upsert_agent(payload) {
+        Ok(agent) => {
+            if let Ok(snapshot) = state.orchestrator.snapshot() {
+                if let Err(err) =
+                    persist_orchestrator_if_db(state.db.as_ref(), identity.org_id, &snapshot).await
+                {
+                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+                }
+            }
+            state.event_bus.publish(
+                "strategy_orchestrator",
+                serde_json::json!({
+                    "event": "agent_upserted",
+                    "agent": agent,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "label": identity.label,
+                        "role": role_code(&identity.role)
+                    }
+                }),
+            );
+            (StatusCode::OK, Json(agent)).into_response()
+        }
+        Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+async fn api_set_strategy_performance(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(raw_agent_id): Path<String>,
+    Json(payload): Json<StrategyPerformanceInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow updating strategy performance".to_string(),
+        );
+    }
+    let agent_id = match uuid::Uuid::parse_str(raw_agent_id.trim()) {
+        Ok(id) => id,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid strategy agent id: {raw_agent_id}"),
+            )
+        }
+    };
+    match state.orchestrator.update_performance(agent_id, payload) {
+        Ok(agent) => {
+            if let Ok(snapshot) = state.orchestrator.snapshot() {
+                if let Err(err) =
+                    persist_orchestrator_if_db(state.db.as_ref(), identity.org_id, &snapshot).await
+                {
+                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+                }
+            }
+            state.event_bus.publish(
+                "strategy_orchestrator",
+                serde_json::json!({
+                    "event": "performance_updated",
+                    "agent": agent,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "label": identity.label,
+                        "role": role_code(&identity.role)
+                    }
+                }),
+            );
+            (StatusCode::OK, Json(agent)).into_response()
+        }
+        Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+async fn api_evaluate_orchestrator(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<OrchestratorEvaluateInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_request_live() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "only admin role can trigger orchestrator evaluation".to_string(),
+        );
+    }
+    let use_intel = payload.use_intel_signals.unwrap_or(true);
+    let tag_weights = if use_intel {
+        match state.intel.tag_weights(24) {
+            Ok(weights) => weights,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    } else {
+        HashMap::new()
+    };
+
+    match state.orchestrator.evaluate(tag_weights.clone()) {
+        Ok(snapshot) => {
+            if let Err(err) =
+                persist_orchestrator_if_db(state.db.as_ref(), identity.org_id, &snapshot).await
+            {
+                return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+            }
+            state.event_bus.publish(
+                "strategy_orchestrator",
+                serde_json::json!({
+                    "event": "evaluation_completed",
+                    "use_intel_signals": use_intel,
+                    "tag_weight_count": tag_weights.len(),
+                    "snapshot": snapshot,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "label": identity.label,
+                        "role": role_code(&identity.role)
+                    }
+                }),
+            );
+            (StatusCode::OK, Json(snapshot)).into_response()
+        }
+        Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
     }
 }
 
@@ -2961,6 +3477,139 @@ impl PgStore {
         out.reverse();
         Ok(out)
     }
+
+    async fn upsert_social_claims(&self, org_id: uuid::Uuid, claims: &[SocialClaim]) -> Result<()> {
+        for claim in claims {
+            let dedup_key = social_claim_dedup_key(claim);
+            sqlx::query(
+                r#"
+                INSERT INTO social_intel_claims (
+                    id, org_id, source, query, author, community, posted_at, captured_at,
+                    url, text_body, brag_score, hype_score, evidence_flags, strategy_tags, dedup_key
+                )
+                VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8,
+                    $9, $10, $11, $12, $13, $14, $15
+                )
+                ON CONFLICT (org_id, dedup_key) DO NOTHING
+                "#,
+            )
+            .bind(claim.id)
+            .bind(org_id)
+            .bind(claim.source.code())
+            .bind(claim.query.as_deref())
+            .bind(claim.author.as_deref())
+            .bind(claim.community.as_deref())
+            .bind(claim.posted_at)
+            .bind(claim.captured_at)
+            .bind(claim.url.as_deref())
+            .bind(&claim.text)
+            .bind(claim.brag_score)
+            .bind(claim.hype_score)
+            .bind(sqlx::types::Json(&claim.evidence_flags))
+            .bind(sqlx::types::Json(&claim.strategy_tags))
+            .bind(dedup_key)
+            .execute(&self.pool)
+            .await
+            .context("failed to upsert social intel claim")?;
+        }
+        Ok(())
+    }
+
+    async fn recent_social_claims(
+        &self,
+        org_id: uuid::Uuid,
+        limit: usize,
+    ) -> Result<Vec<SocialClaim>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, source, query, author, community, posted_at, captured_at, url, text_body,
+                brag_score, hype_score, evidence_flags, strategy_tags
+            FROM social_intel_claims
+            WHERE org_id = $1
+            ORDER BY captured_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(org_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to fetch social intel claims")?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let source_raw: String = row.try_get("source")?;
+            let source = parse_social_source(source_raw)?;
+            let evidence_flags: sqlx::types::Json<Vec<String>> = row.try_get("evidence_flags")?;
+            let strategy_tags: sqlx::types::Json<Vec<String>> = row.try_get("strategy_tags")?;
+            out.push(SocialClaim {
+                id: row.try_get("id")?,
+                source,
+                query: row.try_get("query")?,
+                author: row.try_get("author")?,
+                community: row.try_get("community")?,
+                posted_at: row.try_get("posted_at")?,
+                captured_at: row.try_get("captured_at")?,
+                url: row.try_get("url")?,
+                text: row.try_get("text_body")?,
+                brag_score: row.try_get("brag_score")?,
+                hype_score: row.try_get("hype_score")?,
+                evidence_flags: evidence_flags.0,
+                strategy_tags: strategy_tags.0,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn upsert_orchestrator_snapshot(
+        &self,
+        org_id: uuid::Uuid,
+        snapshot: &orchestrator::OrchestratorSnapshot,
+    ) -> Result<()> {
+        let payload =
+            serde_json::to_value(snapshot).context("failed to encode orchestrator snapshot")?;
+        sqlx::query(
+            r#"
+            INSERT INTO strategy_orchestrator_snapshots (org_id, snapshot_json, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (org_id)
+            DO UPDATE SET snapshot_json = EXCLUDED.snapshot_json, updated_at = NOW()
+            "#,
+        )
+        .bind(org_id)
+        .bind(payload)
+        .execute(&self.pool)
+        .await
+        .context("failed to upsert orchestrator snapshot")?;
+        Ok(())
+    }
+
+    async fn latest_orchestrator_snapshot(
+        &self,
+        org_id: uuid::Uuid,
+    ) -> Result<Option<orchestrator::OrchestratorSnapshot>> {
+        let row = sqlx::query(
+            r#"
+            SELECT snapshot_json
+            FROM strategy_orchestrator_snapshots
+            WHERE org_id = $1
+            LIMIT 1
+            "#,
+        )
+        .bind(org_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch orchestrator snapshot")?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let payload: serde_json::Value = row.try_get("snapshot_json")?;
+        let snapshot: orchestrator::OrchestratorSnapshot =
+            serde_json::from_value(payload).context("invalid orchestrator snapshot JSON")?;
+        Ok(Some(snapshot))
+    }
 }
 
 async fn upsert_org(pool: &PgPool, name: &str) -> Result<uuid::Uuid> {
@@ -3185,6 +3834,24 @@ fn parse_venue(raw: String) -> Result<Venue> {
         "coinbase" => Ok(Venue::Coinbase),
         _ => Err(anyhow!("invalid venue: {raw}")),
     }
+}
+
+fn parse_social_source(raw: String) -> Result<SocialSource> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "x" | "twitter" => Ok(SocialSource::X),
+        "reddit" => Ok(SocialSource::Reddit),
+        "manual" => Ok(SocialSource::Manual),
+        _ => Err(anyhow!("invalid source `{raw}` (expected x|reddit|manual)")),
+    }
+}
+
+fn social_claim_dedup_key(claim: &SocialClaim) -> String {
+    let source = claim.source.code();
+    let url = claim.url.clone().unwrap_or_default().to_ascii_lowercase();
+    let text = claim.text.trim().to_ascii_lowercase();
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{source}|{url}|{text}").as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn default_symbol(venue: &Venue) -> &'static str {

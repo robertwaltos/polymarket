@@ -3,11 +3,19 @@ import type {
   HealthResponse,
   LiveGuardSnapshot,
   LiveKillSwitchInput,
+  ManualSocialClaimInput,
+  OrchestratorSnapshot,
   PlaceOrderInput,
   PlaceOrderResponse,
   PortfolioHistoryResponse,
   PortfolioResponse,
   RecentOrdersResponse,
+  SocialClaimListResponse,
+  SocialScanInput,
+  SocialScanResponse,
+  SocialTagsResponse,
+  StrategyPerformanceInput,
+  UpsertStrategyAgentInput,
   VenueGuardControlInput
 } from "./types";
 
@@ -64,6 +72,65 @@ export class ApiClient {
 
   async liveGuards(): Promise<LiveGuardSnapshot> {
     return this.request<LiveGuardSnapshot>("/v1/execution/guards", { method: "GET" }, true);
+  }
+
+  async intelClaims(limit = 60, source?: "x" | "reddit" | "manual"): Promise<SocialClaimListResponse> {
+    const params = new URLSearchParams();
+    params.set("limit", String(limit));
+    if (source) {
+      params.set("source", source);
+    }
+    return this.request<SocialClaimListResponse>(`/v1/intel/claims?${params.toString()}`, { method: "GET" }, true);
+  }
+
+  async addIntelClaim(payload: ManualSocialClaimInput) {
+    return this.request("/v1/intel/claims", { method: "POST", body: JSON.stringify(payload) }, true);
+  }
+
+  async runIntelScan(payload: SocialScanInput = {}): Promise<SocialScanResponse> {
+    return this.request<SocialScanResponse>(
+      "/v1/intel/scan",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      true
+    );
+  }
+
+  async intelTags(windowHours = 24, topN = 12): Promise<SocialTagsResponse> {
+    return this.request<SocialTagsResponse>(
+      `/v1/intel/tags?window_hours=${encodeURIComponent(windowHours)}&top_n=${encodeURIComponent(topN)}`,
+      { method: "GET" },
+      true
+    );
+  }
+
+  async orchestrator(): Promise<OrchestratorSnapshot> {
+    return this.request<OrchestratorSnapshot>("/v1/orchestrator", { method: "GET" }, true);
+  }
+
+  async upsertStrategyAgent(payload: UpsertStrategyAgentInput) {
+    return this.request("/v1/orchestrator/agents", { method: "POST", body: JSON.stringify(payload) }, true);
+  }
+
+  async updateStrategyPerformance(agentId: string, payload: StrategyPerformanceInput) {
+    return this.request(
+      `/v1/orchestrator/agents/${encodeURIComponent(agentId)}/performance`,
+      { method: "POST", body: JSON.stringify(payload) },
+      true
+    );
+  }
+
+  async evaluateOrchestrator(useIntelSignals = true): Promise<OrchestratorSnapshot> {
+    return this.request<OrchestratorSnapshot>(
+      "/v1/orchestrator/evaluate",
+      {
+        method: "POST",
+        body: JSON.stringify({ use_intel_signals: useIntelSignals })
+      },
+      true
+    );
   }
 
   async setLiveKillSwitch(payload: LiveKillSwitchInput): Promise<LiveGuardSnapshot> {

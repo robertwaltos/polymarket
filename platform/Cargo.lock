@@ -2394,6 +2394,7 @@ dependencies = [
  "hmac",
  "oms",
  "portfolio",
+ "reqwest",
  "risk",
  "serde",
  "serde_json",

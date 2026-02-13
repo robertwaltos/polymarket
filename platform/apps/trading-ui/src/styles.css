@@ -491,6 +491,27 @@ th {
   color: var(--text-soft);
 }
 
+.strategy-form {
+  display: grid;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.strategy-form label {
+  display: grid;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: var(--text-soft);
+}
+
+.tag-cloud {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
 .split {
   display: grid;
   gap: var(--space-3);
@@ -549,6 +570,10 @@ th {
   gap: 9px;
   max-height: 270px;
   overflow: auto;
+}
+
+.activity-list.mini {
+  max-height: 190px;
 }
 
 .activity-item {

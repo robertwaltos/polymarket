@@ -6,6 +6,8 @@ export interface HealthResponse {
   execution_mode_default: ExecutionMode;
   audit_recent_count: number;
   db_enabled: boolean;
+  intel_claims?: number;
+  orchestrator_agents?: number;
 }
 
 export interface LiveGuardConfig {
@@ -140,4 +142,150 @@ export interface LiveKillSwitchInput {
 export interface VenueGuardControlInput {
   live_enabled?: boolean;
   reset_breaker?: boolean;
+}
+
+export type SocialSource = "x" | "reddit" | "manual";
+
+export interface SocialClaim {
+  id: string;
+  source: SocialSource;
+  query: string | null;
+  author: string | null;
+  community: string | null;
+  posted_at: string | null;
+  captured_at: string;
+  url: string | null;
+  text: string;
+  brag_score: number;
+  hype_score: number;
+  evidence_flags: string[];
+  strategy_tags: string[];
+}
+
+export interface SocialClaimListResponse {
+  claims: SocialClaim[];
+}
+
+export interface SocialTagSignal {
+  tag: string;
+  mentions: number;
+  weight: number;
+}
+
+export interface SocialTagsResponse {
+  window_hours: number;
+  tags: SocialTagSignal[];
+}
+
+export interface SourceScanStatus {
+  source: SocialSource;
+  ok: boolean;
+  inserted: number;
+  detail: string | null;
+}
+
+export interface SocialScanResponse {
+  started_at: string;
+  finished_at: string;
+  inserted: number;
+  total_claims: number;
+  source_status: SourceScanStatus[];
+  top_tags: SocialTagSignal[];
+}
+
+export interface ManualSocialClaimInput {
+  source?: SocialSource;
+  text: string;
+  url?: string;
+  author?: string;
+  community?: string;
+  query?: string;
+}
+
+export interface SocialScanInput {
+  sources?: SocialSource[];
+  queries?: string[];
+  lookback_days?: number;
+  max_per_query?: number;
+}
+
+export type StrategyLifecycle = "active" | "paused" | "killed";
+
+export interface StrategyPerformance {
+  total_return_pct: number;
+  sharpe: number;
+  max_drawdown_pct: number;
+  win_rate: number;
+  trades: number;
+  updated_at: string;
+}
+
+export interface StrategyAgent {
+  id: string;
+  name: string;
+  venue: string | null;
+  description: string | null;
+  tags: string[];
+  lifecycle: StrategyLifecycle;
+  allocation_usd: number;
+  score: number;
+  rank: number;
+  last_score_note: string | null;
+  performance: StrategyPerformance;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface OrchestratorAction {
+  at: string;
+  agent_id: string;
+  agent_name: string;
+  action: string;
+  reason: string;
+  allocation_before_usd: number;
+  allocation_after_usd: number;
+}
+
+export interface OrchestratorTagBias {
+  tag: string;
+  weight: number;
+}
+
+export interface OrchestratorConfig {
+  total_capital_usd: number;
+  starting_allocation_usd: number;
+  max_allocation_per_strategy_usd: number;
+  promote_multiplier: number;
+  promote_top_n: number;
+  kill_bottom_n: number;
+  min_trades_before_ranking: number;
+  kill_drawdown_pct: number;
+  kill_score_threshold: number;
+}
+
+export interface OrchestratorSnapshot {
+  config: OrchestratorConfig;
+  evaluated_at: string | null;
+  total_allocated_usd: number;
+  agents: StrategyAgent[];
+  last_actions: OrchestratorAction[];
+  active_tag_bias: OrchestratorTagBias[];
+}
+
+export interface UpsertStrategyAgentInput {
+  id?: string;
+  name: string;
+  venue?: string;
+  description?: string;
+  tags?: string[];
+  active?: boolean;
+  allocation_usd?: number;
+}
+
+export interface StrategyPerformanceInput {
+  total_return_pct: number;
+  sharpe: number;
+  max_drawdown_pct: number;
+  win_rate: number;
+  trades: number;
 }

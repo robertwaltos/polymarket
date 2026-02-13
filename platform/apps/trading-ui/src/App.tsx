@@ -7,10 +7,13 @@ import type {
   HealthResponse,
   LiveGuardSnapshot,
   LiveGuardVenueState,
+  OrchestratorSnapshot,
   PlaceOrderInput,
   PortfolioHistorySnapshot,
   PortfolioResponse,
-  RecentOrderRecord
+  RecentOrderRecord,
+  SocialClaim,
+  SocialTagSignal
 } from "./types";
 
 type Theme = "night" | "day";
@@ -54,6 +57,9 @@ export default function App() {
   const [portfolio, setPortfolio] = useState<PortfolioResponse | null>(null);
   const [history, setHistory] = useState<PortfolioHistorySnapshot[]>([]);
   const [orders, setOrders] = useState<RecentOrderRecord[]>([]);
+  const [intelClaims, setIntelClaims] = useState<SocialClaim[]>([]);
+  const [intelTags, setIntelTags] = useState<SocialTagSignal[]>([]);
+  const [orchestrator, setOrchestrator] = useState<OrchestratorSnapshot | null>(null);
   const [session, setSession] = useState<SessionState | null>(() => {
     const raw = localStorage.getItem(SESSION_STORAGE_KEY);
     if (!raw) return null;
@@ -70,8 +76,15 @@ export default function App() {
   const [orderDraft, setOrderDraft] = useState(defaultOrderDraft);
   const [busy, setBusy] = useState(false);
   const [guardBusy, setGuardBusy] = useState(false);
+  const [automationBusy, setAutomationBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [killSwitchReason, setKillSwitchReason] = useState("");
+  const [strategyDraft, setStrategyDraft] = useState({
+    name: "",
+    venue: "coinbase",
+    tags: "multi_agent,momentum",
+    allocation: "5000"
+  });
   const [activity, setActivity] = useState<ActivityItem[]>([]);
   const [streamStatus, setStreamStatus] = useState<"idle" | "connecting" | "live" | "error">("idle");
 
@@ -108,6 +121,9 @@ export default function App() {
       setHistory([]);
       setOrders([]);
       setLiveGuards(null);
+      setIntelClaims([]);
+      setIntelTags([]);
+      setOrchestrator(null);
       setStreamStatus("idle");
       return;
     }
@@ -142,16 +158,23 @@ export default function App() {
 
     const refreshFromStream = async () => {
       try {
-        const [portfolioData, historyData, ordersData, guardsData] = await Promise.all([
+        const [portfolioData, historyData, ordersData, guardsData, intelData, tagData, orchestratorData] =
+          await Promise.all([
           api.portfolio(),
           api.portfolioHistory(40),
           api.recentOrders(25),
-          api.liveGuards()
+          api.liveGuards(),
+          api.intelClaims(40),
+          api.intelTags(24, 10),
+          api.orchestrator()
         ]);
         setPortfolio(portfolioData);
         setHistory(historyData.snapshots);
         setOrders(ordersData.records);
         setLiveGuards(guardsData);
+        setIntelClaims(intelData.claims);
+        setIntelTags(tagData.tags);
+        setOrchestrator(orchestratorData);
       } catch {
         // polling loop continues as fallback
       }
@@ -180,6 +203,16 @@ export default function App() {
 
     source.addEventListener("execution_guard", () => {
       pushActivity("warn", "Execution guard state changed.");
+      void refreshFromStream();
+    });
+
+    source.addEventListener("social_intel", () => {
+      pushActivity("info", "Social intel updated.");
+      void refreshFromStream();
+    });
+
+    source.addEventListener("strategy_orchestrator", () => {
+      pushActivity("warn", "Strategy orchestrator updated.");
       void refreshFromStream();
     });
 
@@ -234,16 +267,23 @@ export default function App() {
   async function loadProtectedData() {
     if (!session) return;
     try {
-      const [portfolioData, historyData, ordersData, guardData] = await Promise.all([
+      const [portfolioData, historyData, ordersData, guardData, intelData, tagData, orchestratorData] =
+        await Promise.all([
         api.portfolio(),
         api.portfolioHistory(40),
         api.recentOrders(25),
-        api.liveGuards()
+        api.liveGuards(),
+        api.intelClaims(50),
+        api.intelTags(24, 12),
+        api.orchestrator()
       ]);
       setPortfolio(portfolioData);
       setHistory(historyData.snapshots);
       setOrders(ordersData.records);
       setLiveGuards(guardData);
+      setIntelClaims(intelData.claims);
+      setIntelTags(tagData.tags);
+      setOrchestrator(orchestratorData);
       setError(null);
     } catch (err) {
       const message = errorMessage(err);
@@ -355,6 +395,95 @@ export default function App() {
       appendActivity("error", `Venue guard update failed: ${message}`);
     } finally {
       setGuardBusy(false);
+    }
+  }
+
+  async function handleRunIntelScan() {
+    if (!session) {
+      setError("Login required to run social intel scans.");
+      return;
+    }
+    setAutomationBusy(true);
+    try {
+      const result = await api.runIntelScan({
+        lookback_days: 4,
+        max_per_query: 20
+      });
+      const [claims, tags] = await Promise.all([api.intelClaims(50), api.intelTags(24, 12)]);
+      setIntelClaims(claims.claims);
+      setIntelTags(tags.tags);
+      appendActivity("info", `Intel scan inserted ${result.inserted} claims.`);
+      setError(null);
+    } catch (err) {
+      const message = errorMessage(err);
+      setError(message);
+      appendActivity("error", `Intel scan failed: ${message}`);
+    } finally {
+      setAutomationBusy(false);
+    }
+  }
+
+  async function handleEvaluateOrchestrator() {
+    if (!session) {
+      setError("Login required to evaluate strategy orchestrator.");
+      return;
+    }
+    setAutomationBusy(true);
+    try {
+      const snapshot = await api.evaluateOrchestrator(true);
+      setOrchestrator(snapshot);
+      appendActivity("warn", `Orchestrator evaluated. ${snapshot.last_actions.length} actions.`);
+      setError(null);
+    } catch (err) {
+      const message = errorMessage(err);
+      setError(message);
+      appendActivity("error", `Orchestrator evaluation failed: ${message}`);
+    } finally {
+      setAutomationBusy(false);
+    }
+  }
+
+  async function handleAddStrategyAgent(event: FormEvent) {
+    event.preventDefault();
+    if (!session) {
+      setError("Login required to add strategy agents.");
+      return;
+    }
+    const name = strategyDraft.name.trim();
+    if (!name) {
+      setError("Strategy name is required.");
+      return;
+    }
+    const allocation = Number(strategyDraft.allocation);
+    if (!Number.isFinite(allocation) || allocation <= 0) {
+      setError("Allocation must be a positive number.");
+      return;
+    }
+
+    const tags = strategyDraft.tags
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => value.length > 0);
+
+    setAutomationBusy(true);
+    try {
+      await api.upsertStrategyAgent({
+        name,
+        venue: strategyDraft.venue,
+        tags,
+        allocation_usd: allocation,
+        active: true
+      });
+      setStrategyDraft((prev) => ({ ...prev, name: "", tags: "multi_agent,momentum" }));
+      await loadProtectedData();
+      appendActivity("info", `Strategy agent added: ${name}`);
+      setError(null);
+    } catch (err) {
+      const message = errorMessage(err);
+      setError(message);
+      appendActivity("error", `Strategy create failed: ${message}`);
+    } finally {
+      setAutomationBusy(false);
     }
   }
 
@@ -594,6 +723,8 @@ export default function App() {
               Kill: {liveGuards?.global.kill_switch_enabled ? "ENGAGED" : "OFF"}
             </span>
             <span className={`pill ${streamStatusTone(streamStatus)}`}>Stream: {streamStatus}</span>
+            <span className="pill neutral">Intel: {health?.intel_claims ?? intelClaims.length}</span>
+            <span className="pill neutral">Agents: {orchestrator?.agents.length ?? health?.orchestrator_agents ?? 0}</span>
             {error && <span className="pill danger">Issue: {error}</span>}
           </div>
           <div className="actions-row">
@@ -785,6 +916,155 @@ export default function App() {
                 {busy ? "Submitting..." : "Submit Order"}
               </button>
             </form>
+          </article>
+
+          <article className="panel">
+            <div className="panel-header">
+              <h3 className="panel-title">Social Intel Scanner</h3>
+              <p className="hint">Fresh crowd strategy claims (X + Reddit)</p>
+            </div>
+            <div className="split two">
+              <button className="button ghost" onClick={() => void handleRunIntelScan()} disabled={!session || automationBusy}>
+                {automationBusy ? "Scanning..." : "Run Scan"}
+              </button>
+              <button className="button ghost" onClick={() => void handleEvaluateOrchestrator()} disabled={!session || automationBusy}>
+                Rank + Rebalance
+              </button>
+            </div>
+            <div className="tag-cloud">
+              {intelTags.length === 0 ? (
+                <p className="hint">No tag signals yet.</p>
+              ) : (
+                intelTags.map((signal) => (
+                  <span key={signal.tag} className="pill small neutral">
+                    {signal.tag} ({signal.mentions})
+                  </span>
+                ))
+              )}
+            </div>
+            <div className="activity-list mini">
+              {intelClaims.length === 0 ? (
+                <p className="hint">No captured claims.</p>
+              ) : (
+                intelClaims.slice(0, 5).map((claim) => (
+                  <div key={claim.id} className="activity-item info">
+                    <span className="mono">{claim.source.toUpperCase()}</span>
+                    <span title={claim.text}>{claim.text.slice(0, 120)}{claim.text.length > 120 ? "..." : ""}</span>
+                  </div>
+                ))
+              )}
+            </div>
+          </article>
+
+          <article className="panel wide">
+            <div className="panel-header">
+              <h3 className="panel-title">Strategy Orchestrator</h3>
+              <p className="hint">Promote top performers, kill worst performers</p>
+            </div>
+            <form className="strategy-form" onSubmit={handleAddStrategyAgent}>
+              <div className="split two">
+                <label>
+                  Strategy Name
+                  <input
+                    className="field"
+                    value={strategyDraft.name}
+                    onChange={(event) => setStrategyDraft((prev) => ({ ...prev, name: event.target.value }))}
+                    placeholder="Cross-venue momentum"
+                  />
+                </label>
+                <label>
+                  Venue
+                  <select
+                    className="field"
+                    value={strategyDraft.venue}
+                    onChange={(event) => setStrategyDraft((prev) => ({ ...prev, venue: event.target.value }))}
+                  >
+                    <option value="coinbase">Coinbase</option>
+                    <option value="ibkr">IBKR</option>
+                    <option value="kalshi">Kalshi</option>
+                  </select>
+                </label>
+              </div>
+              <div className="split two">
+                <label>
+                  Tags (comma separated)
+                  <input
+                    className="field"
+                    value={strategyDraft.tags}
+                    onChange={(event) => setStrategyDraft((prev) => ({ ...prev, tags: event.target.value }))}
+                    placeholder="multi_agent,momentum,cross_venue"
+                  />
+                </label>
+                <label>
+                  Initial Allocation (USD)
+                  <input
+                    className="field"
+                    inputMode="decimal"
+                    value={strategyDraft.allocation}
+                    onChange={(event) => setStrategyDraft((prev) => ({ ...prev, allocation: event.target.value }))}
+                  />
+                </label>
+              </div>
+              <button type="submit" className="button primary" disabled={!session || automationBusy}>
+                Add Strategy Agent
+              </button>
+            </form>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Rank</th>
+                    <th>Strategy</th>
+                    <th>State</th>
+                    <th>Score</th>
+                    <th>Alloc</th>
+                    <th>Sharpe</th>
+                    <th>Ret%</th>
+                    <th>DD%</th>
+                    <th>Trades</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {!orchestrator || orchestrator.agents.length === 0 ? (
+                    <tr>
+                      <td colSpan={9} className="empty-row">
+                        No strategy agents configured
+                      </td>
+                    </tr>
+                  ) : (
+                    orchestrator.agents.map((agent) => (
+                      <tr key={agent.id}>
+                        <td>{agent.rank > 1_000_000 ? "--" : agent.rank}</td>
+                        <td title={agent.tags.join(", ")}>{agent.name}</td>
+                        <td>
+                          <span className={`pill small ${agent.lifecycle === "killed" ? "danger" : agent.lifecycle === "active" ? "good" : "warn"}`}>
+                            {agent.lifecycle}
+                          </span>
+                        </td>
+                        <td>{agent.score.toFixed(2)}</td>
+                        <td>${agent.allocation_usd.toFixed(0)}</td>
+                        <td>{agent.performance.sharpe.toFixed(2)}</td>
+                        <td>{agent.performance.total_return_pct.toFixed(2)}</td>
+                        <td>{agent.performance.max_drawdown_pct.toFixed(2)}</td>
+                        <td>{agent.performance.trades}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+            {orchestrator && orchestrator.last_actions.length > 0 && (
+              <div className="activity-list mini">
+                {orchestrator.last_actions.slice(0, 5).map((action) => (
+                  <div key={`${action.at}-${action.agent_id}-${action.action}`} className="activity-item warn">
+                    <span className="mono">{new Date(action.at).toLocaleTimeString()}</span>
+                    <span>
+                      {action.action.toUpperCase()} {action.agent_name}: {action.reason}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
           </article>
 
           <article className="panel wide">
