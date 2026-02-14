@@ -163,8 +163,10 @@ dependencies = [
  "domain",
  "oms",
  "portfolio",
+ "rand",
  "risk",
  "serde",
+ "tokio",
 ]
 
 [[package]]
@@ -1211,6 +1213,7 @@ name = "oms"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "domain",
  "portfolio",
@@ -1218,6 +1221,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "tokio",
  "tracing",
  "uuid",
  "venue_adapters",
@@ -1617,10 +1621,12 @@ dependencies = [
 name = "risk"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "domain",
  "portfolio",
  "serde",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -2392,6 +2398,7 @@ dependencies = [
  "domain",
  "dotenvy",
  "hmac",
+ "indexmap 2.13.0",
  "oms",
  "portfolio",
  "reqwest",

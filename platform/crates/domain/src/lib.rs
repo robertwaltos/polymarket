@@ -178,6 +178,38 @@ pub struct PositionSnapshot {
     pub unrealized_pnl: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum InstrumentLifecycle {
+    New,
+    Tradable,
+    WatchlistOnly,
+    Deprecated,
+}
+
+impl InstrumentLifecycle {
+    pub fn is_tradable(self) -> bool {
+        matches!(self, Self::Tradable)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CanonicalInstrument {
+    pub id: Uuid,
+    pub canonical_event_id: String,
+    pub canonical_outcome_id: String,
+    pub canonical_event_title: Option<String>,
+    pub outcome_label: String,
+    pub venue: Venue,
+    pub symbol: String,
+    pub confidence: f64,
+    pub lifecycle: InstrumentLifecycle,
+    pub manual_override: bool,
+    pub metadata: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExecutionContext {
     pub mode: ExecutionMode,

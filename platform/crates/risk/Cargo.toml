@@ -9,3 +9,7 @@ domain = { path = "../domain" }
 portfolio = { path = "../portfolio" }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+uuid.workspace = true

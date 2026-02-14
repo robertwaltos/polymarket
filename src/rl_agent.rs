@@ -1,7 +1,8 @@
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StateKey {
     edge_bucket: i32,
     bankroll_bucket: i32,
@@ -14,11 +15,27 @@ pub struct RlDecision {
     pub state: StateKey,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederatedQEntry {
+    pub edge_bucket: i32,
+    pub bankroll_bucket: i32,
+    pub q_values: [f64; 3],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QLearningSnapshot {
+    pub policy_version: u64,
+    pub training_steps: u64,
+    pub entries: Vec<FederatedQEntry>,
+}
+
 pub struct QLearningAgent {
     q_table: HashMap<StateKey, [f64; 3]>,
     epsilon: f64,
     alpha: f64,
     gamma: f64,
+    policy_version: u64,
+    training_steps: u64,
 }
 
 impl QLearningAgent {
@@ -28,6 +45,8 @@ impl QLearningAgent {
             epsilon,
             alpha,
             gamma,
+            policy_version: 1,
+            training_steps: 0,
         }
     }
 
@@ -71,6 +90,8 @@ impl QLearningAgent {
         let target = reward + self.gamma * max_next;
         let current = q_values[action];
         q_values[action] = current + self.alpha * (target - current);
+        self.training_steps = self.training_steps.saturating_add(1);
+        self.policy_version = self.policy_version.saturating_add(1);
     }
 
     pub fn set_alpha(&mut self, alpha: f64) {
@@ -83,6 +104,60 @@ impl QLearningAgent {
         if (0.0..=1.0).contains(&epsilon) {
             self.epsilon = epsilon;
         }
+    }
+
+    pub fn policy_version(&self) -> u64 {
+        self.policy_version
+    }
+
+    pub fn snapshot(&self) -> QLearningSnapshot {
+        let mut entries = self
+            .q_table
+            .iter()
+            .map(|(state, values)| FederatedQEntry {
+                edge_bucket: state.edge_bucket,
+                bankroll_bucket: state.bankroll_bucket,
+                q_values: *values,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| (entry.edge_bucket, entry.bankroll_bucket));
+
+        QLearningSnapshot {
+            policy_version: self.policy_version,
+            training_steps: self.training_steps.max(1),
+            entries,
+        }
+    }
+
+    pub fn merge_snapshot(&mut self, snapshot: &QLearningSnapshot, blend: f64) -> usize {
+        let weight = blend.clamp(0.0, 1.0);
+        if snapshot.entries.is_empty() {
+            return 0;
+        }
+
+        let mut merged = 0usize;
+        for entry in &snapshot.entries {
+            let state = StateKey {
+                edge_bucket: entry.edge_bucket,
+                bankroll_bucket: entry.bankroll_bucket,
+            };
+            let local = self.q_table.entry(state).or_insert(entry.q_values);
+            if weight < 1.0 {
+                for (idx, local_value) in local.iter_mut().enumerate() {
+                    *local_value = (*local_value * (1.0 - weight)) + (entry.q_values[idx] * weight);
+                }
+            } else {
+                *local = entry.q_values;
+            }
+            merged = merged.saturating_add(1);
+        }
+
+        self.training_steps = self.training_steps.max(snapshot.training_steps);
+        self.policy_version = self
+            .policy_version
+            .max(snapshot.policy_version)
+            .saturating_add(1);
+        merged
     }
 }
 

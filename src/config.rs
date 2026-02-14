@@ -78,6 +78,20 @@ pub struct Config {
     pub rl_gamma: f64,
     pub enable_pq_signing: bool,
     pub enable_federated: bool,
+    pub federated_cluster_id: String,
+    pub federated_peer_id: String,
+    pub federated_shared_key: Option<String>,
+    pub federated_sync_dir: String,
+    pub federated_min_peer_updates: usize,
+    pub federated_max_snapshot_age_secs: u64,
+    pub federated_secure_aggregation: bool,
+    pub federated_local_blend: f64,
+    pub enable_ev_scheduler: bool,
+    pub scheduler_cycle_token_budget: u64,
+    pub scheduler_ev_floor: f64,
+    pub scheduler_max_candidates: usize,
+    pub scheduler_urgent_window_hours: i64,
+    pub scheduler_timezone_offset_hours: i32,
     pub enable_arb_bridge: bool,
     pub arbitrum_rpc_url: Option<String>,
     pub arbitrum_chain_id: u64,
@@ -232,6 +246,37 @@ impl Config {
         let rl_gamma = env_f64("RL_GAMMA", 0.9);
         let enable_pq_signing = env_bool("ENABLE_PQ_SIGNING", false);
         let enable_federated = env_bool("ENABLE_FEDERATED", false);
+        let federated_cluster_id = env::var("FEDERATED_CLUSTER_ID")
+            .unwrap_or_else(|_| "default-cluster".to_string());
+        let federated_peer_id = env_opt("FEDERATED_PEER_ID").unwrap_or_else(|| {
+            env_opt("COMPUTERNAME")
+                .or_else(|| env_opt("HOSTNAME"))
+                .unwrap_or_else(|| format!("agent-{}", std::process::id()))
+        });
+        let federated_shared_key = env_opt("FEDERATED_SHARED_KEY");
+        let federated_sync_dir = env::var("FEDERATED_SYNC_DIR")
+            .unwrap_or_else(|_| ".federated_sync".to_string());
+        let federated_min_peer_updates = env_usize("FEDERATED_MIN_PEER_UPDATES", 1).max(1);
+        let federated_max_snapshot_age_secs =
+            env_u64("FEDERATED_MAX_SNAPSHOT_AGE_SECS", 3600).max(30);
+        let federated_secure_aggregation = env_bool("FEDERATED_SECURE_AGGREGATION", true);
+        let federated_local_blend = env_f64("FEDERATED_LOCAL_BLEND", 0.35).clamp(0.05, 1.0);
+        let enable_ev_scheduler = env_bool("ENABLE_EV_SCHEDULER", true);
+        let scheduler_cycle_token_budget = env_u64(
+            "SCHEDULER_CYCLE_TOKEN_BUDGET",
+            anthropic_input_tokens_per_minute.max(1),
+        )
+        .max(1);
+        let scheduler_ev_floor = env_f64("SCHEDULER_EV_FLOOR", 0.01).clamp(0.0, 1.0);
+        let scheduler_max_candidates = env_usize(
+            "SCHEDULER_MAX_CANDIDATES",
+            anthropic_max_markets_per_cycle.saturating_mul(4),
+        )
+        .max(1);
+        let scheduler_urgent_window_hours =
+            env_i64("SCHEDULER_URGENT_WINDOW_HOURS", 48).clamp(1, 24 * 14);
+        let scheduler_timezone_offset_hours =
+            env_i32("SCHEDULER_TIMEZONE_OFFSET_HOURS", 0).clamp(-12, 14);
         let enable_arb_bridge = env_bool("ENABLE_ARB_BRIDGE", false);
         let arbitrum_rpc_url = env_opt("ARBITRUM_RPC_URL");
         let arbitrum_chain_id = env_u64("ARBITRUM_CHAIN_ID", 42161);
@@ -325,6 +370,20 @@ impl Config {
             rl_gamma,
             enable_pq_signing,
             enable_federated,
+            federated_cluster_id,
+            federated_peer_id,
+            federated_shared_key,
+            federated_sync_dir,
+            federated_min_peer_updates,
+            federated_max_snapshot_age_secs,
+            federated_secure_aggregation,
+            federated_local_blend,
+            enable_ev_scheduler,
+            scheduler_cycle_token_budget,
+            scheduler_ev_floor,
+            scheduler_max_candidates,
+            scheduler_urgent_window_hours,
+            scheduler_timezone_offset_hours,
             enable_arb_bridge,
             arbitrum_rpc_url,
             arbitrum_chain_id,
@@ -463,6 +522,13 @@ fn env_i64(key: &str, default: i64) -> i64 {
     env::var(key)
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_i32(key: &str, default: i32) -> i32 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<i32>().ok())
         .unwrap_or(default)
 }
 

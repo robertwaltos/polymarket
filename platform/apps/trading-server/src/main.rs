@@ -1,5 +1,6 @@
 mod intel;
 mod orchestrator;
+mod slicing;
 
 use anyhow::{anyhow, Context, Result};
 use argon2::password_hash::SaltString;
@@ -23,7 +24,8 @@ use hmac::{Hmac, Mac};
 use intel::{ManualClaimInput, SocialClaim, SocialScanRequest, SocialSource};
 use oms::{JsonlAuditStore, OmsConfig, OmsEngine, OmsError, OrderAuditRecord};
 use orchestrator::{
-    OrchestratorConfig, StrategyOrchestrator, StrategyPerformanceInput, UpsertStrategyAgentInput,
+    CapitalAllocationInput, EnsemblePolicyInput, OrchestratorConfig, StrategyOrchestrator,
+    StrategyPerformanceInput, UpsertStrategyAgentInput,
 };
 use portfolio::PortfolioState;
 use risk::{RiskEngine, RiskLimits};
@@ -31,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
@@ -55,9 +58,12 @@ struct AppState {
     default_mode: ExecutionMode,
     db: Option<Arc<PgStore>>,
     rate_limiter: OrgRateLimiter,
+    trade_guard: HierarchicalTradeGuard,
     live_guard: LiveExecutionGuard,
     intel: intel::SocialIntelStore,
     orchestrator: StrategyOrchestrator,
+    registry: InstrumentRegistryStore,
+    research: ResearchRunStore,
     event_bus: EventBus,
 }
 
@@ -128,6 +134,203 @@ impl OmsManager {
 }
 
 #[derive(Clone)]
+struct InstrumentRegistryStore {
+    entries: Arc<Mutex<HashMap<uuid::Uuid, HashMap<String, domain::CanonicalInstrument>>>>,
+}
+
+impl Default for InstrumentRegistryStore {
+    fn default() -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl InstrumentRegistryStore {
+    fn upsert(
+        &self,
+        org_id: uuid::Uuid,
+        record: domain::CanonicalInstrument,
+    ) -> Result<domain::CanonicalInstrument> {
+        let mut guard = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow!("instrument registry lock poisoned"))?;
+        let org_bucket = guard.entry(org_id).or_default();
+        org_bucket.insert(registry_key(&record.venue, &record.symbol), record.clone());
+        Ok(record)
+    }
+
+    fn list(
+        &self,
+        org_id: uuid::Uuid,
+        query: &InstrumentRegistryQuery,
+    ) -> Result<Vec<domain::CanonicalInstrument>> {
+        let guard = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow!("instrument registry lock poisoned"))?;
+        let Some(records) = guard.get(&org_id) else {
+            return Ok(Vec::new());
+        };
+        Ok(filter_registry_records(records.values().cloned().collect(), query))
+    }
+
+    fn lookup(
+        &self,
+        org_id: uuid::Uuid,
+        venue: &Venue,
+        symbol: &str,
+    ) -> Result<Option<domain::CanonicalInstrument>> {
+        let guard = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow!("instrument registry lock poisoned"))?;
+        let Some(records) = guard.get(&org_id) else {
+            return Ok(None);
+        };
+        Ok(records.get(&registry_key(venue, symbol)).cloned())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ResearchRunStatus {
+    Pass,
+    Fail,
+    ManualReview,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResearchMetrics {
+    sharpe: f64,
+    max_drawdown_pct: f64,
+    total_return_pct: f64,
+    trades: u64,
+    #[serde(default)]
+    turnover_pct: Option<f64>,
+    #[serde(default)]
+    hit_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResearchAcceptanceThresholds {
+    min_sharpe: f64,
+    max_drawdown_pct: f64,
+    min_trades: u64,
+    min_return_pct: f64,
+    min_sharpe_delta_vs_baseline: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResearchAcceptanceResult {
+    pass: bool,
+    status: ResearchRunStatus,
+    reasons: Vec<String>,
+    thresholds: ResearchAcceptanceThresholds,
+    sharpe_delta_vs_baseline: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResearchRunRecord {
+    id: uuid::Uuid,
+    org_id: uuid::Uuid,
+    strategy_id: Option<uuid::Uuid>,
+    dataset_snapshot_id: String,
+    feature_set_hash: String,
+    code_version: String,
+    config_hash: String,
+    baseline_run_id: Option<uuid::Uuid>,
+    metrics: ResearchMetrics,
+    acceptance: ResearchAcceptanceResult,
+    status: ResearchRunStatus,
+    artifact_uri: Option<String>,
+    notes: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+struct ResearchAcceptanceConfig {
+    min_sharpe: f64,
+    max_drawdown_pct: f64,
+    min_trades: u64,
+    min_return_pct: f64,
+    min_sharpe_delta_vs_baseline: f64,
+}
+
+impl ResearchAcceptanceConfig {
+    fn from_env() -> Self {
+        Self {
+            min_sharpe: env_f64("RESEARCH_MIN_SHARPE", 0.8),
+            max_drawdown_pct: env_f64("RESEARCH_MAX_DRAWDOWN_PCT", 18.0).max(1.0),
+            min_trades: env_u64("RESEARCH_MIN_TRADES", 50),
+            min_return_pct: env_f64("RESEARCH_MIN_RETURN_PCT", 2.0),
+            min_sharpe_delta_vs_baseline: env_f64("RESEARCH_MIN_SHARPE_DELTA", 0.1),
+        }
+    }
+
+    fn thresholds(&self) -> ResearchAcceptanceThresholds {
+        ResearchAcceptanceThresholds {
+            min_sharpe: self.min_sharpe,
+            max_drawdown_pct: self.max_drawdown_pct,
+            min_trades: self.min_trades,
+            min_return_pct: self.min_return_pct,
+            min_sharpe_delta_vs_baseline: self.min_sharpe_delta_vs_baseline,
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct ResearchRunStore {
+    records: Arc<Mutex<HashMap<uuid::Uuid, Vec<ResearchRunRecord>>>>,
+}
+
+impl ResearchRunStore {
+    fn insert(&self, record: ResearchRunRecord) -> Result<ResearchRunRecord> {
+        let mut guard = self
+            .records
+            .lock()
+            .map_err(|_| anyhow!("research run store lock poisoned"))?;
+        let bucket = guard.entry(record.org_id).or_default();
+        bucket.push(record.clone());
+        bucket.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(record)
+    }
+
+    fn list(
+        &self,
+        org_id: uuid::Uuid,
+        limit: usize,
+        strategy_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<ResearchRunRecord>> {
+        let guard = self
+            .records
+            .lock()
+            .map_err(|_| anyhow!("research run store lock poisoned"))?;
+        let mut records = guard.get(&org_id).cloned().unwrap_or_default();
+        if let Some(strategy_id) = strategy_id {
+            records.retain(|record| record.strategy_id == Some(strategy_id));
+        }
+        records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let safe_limit = limit.clamp(1, 5_000);
+        if records.len() > safe_limit {
+            records.truncate(safe_limit);
+        }
+        Ok(records)
+    }
+
+    fn get(&self, org_id: uuid::Uuid, run_id: uuid::Uuid) -> Result<Option<ResearchRunRecord>> {
+        let guard = self
+            .records
+            .lock()
+            .map_err(|_| anyhow!("research run store lock poisoned"))?;
+        Ok(guard
+            .get(&org_id)
+            .and_then(|records| records.iter().find(|record| record.id == run_id).cloned()))
+    }
+}
+
+#[derive(Clone)]
 struct OrgRateLimiter {
     max_per_minute: usize,
     events: Arc<Mutex<HashMap<uuid::Uuid, Vec<i64>>>>,
@@ -154,6 +357,241 @@ impl OrgRateLimiter {
         }
         bucket.push(now_epoch_secs);
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TradeGuardConfig {
+    org_orders_per_min: usize,
+    strategy_orders_per_min: usize,
+    instrument_orders_per_min: usize,
+    strategy_cooldown_secs: i64,
+    max_spread_cross_bps: Option<f64>,
+    max_adverse_selection_bps: Option<f64>,
+}
+
+impl TradeGuardConfig {
+    fn from_env() -> Self {
+        Self {
+            org_orders_per_min: env_u32("TRADE_GUARD_ORG_ORDERS_PER_MIN", 240) as usize,
+            strategy_orders_per_min: env_u32("TRADE_GUARD_STRATEGY_ORDERS_PER_MIN", 120) as usize,
+            instrument_orders_per_min: env_u32("TRADE_GUARD_INSTRUMENT_ORDERS_PER_MIN", 80)
+                as usize,
+            strategy_cooldown_secs: env_i64("TRADE_GUARD_STRATEGY_COOLDOWN_SECS", 120).max(5),
+            max_spread_cross_bps: env_optional_positive_f64("TRADE_GUARD_MAX_SPREAD_CROSS_BPS"),
+            max_adverse_selection_bps: env_optional_positive_f64(
+                "TRADE_GUARD_MAX_ADVERSE_SELECTION_BPS",
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct StrategyBucketKey {
+    org_id: uuid::Uuid,
+    strategy_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct InstrumentBucketKey {
+    org_id: uuid::Uuid,
+    venue: Venue,
+    symbol: String,
+}
+
+#[derive(Debug, Clone)]
+struct TradeGuardState {
+    org_events: HashMap<uuid::Uuid, Vec<i64>>,
+    strategy_events: HashMap<StrategyBucketKey, Vec<i64>>,
+    instrument_events: HashMap<InstrumentBucketKey, Vec<i64>>,
+    strategy_cooldowns: HashMap<StrategyBucketKey, DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone)]
+struct TradeGuardInput {
+    org_id: uuid::Uuid,
+    strategy_id: Option<uuid::Uuid>,
+    venue: Venue,
+    symbol: String,
+    order_type: OrderType,
+    metadata: indexmap::IndexMap<String, String>,
+    now: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct HierarchicalTradeGuard {
+    config: TradeGuardConfig,
+    state: Arc<Mutex<TradeGuardState>>,
+}
+
+impl HierarchicalTradeGuard {
+    fn new(config: TradeGuardConfig) -> Self {
+        Self {
+            config,
+            state: Arc::new(Mutex::new(TradeGuardState {
+                org_events: HashMap::new(),
+                strategy_events: HashMap::new(),
+                instrument_events: HashMap::new(),
+                strategy_cooldowns: HashMap::new(),
+            })),
+        }
+    }
+
+    fn authorize_and_record(&self, input: &TradeGuardInput) -> Result<(), String> {
+        let now = input.now;
+        let now_epoch = now.timestamp();
+        let window_start = now_epoch - 60;
+
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| "trade guard lock poisoned".to_string())?;
+
+        if let Some(strategy_id) = input.strategy_id {
+            let strategy_key = StrategyBucketKey {
+                org_id: input.org_id,
+                strategy_id,
+            };
+            if let Some(cooldown_until) = guard.strategy_cooldowns.get(&strategy_key) {
+                if *cooldown_until > now {
+                    return Err(format!(
+                        "strategy cooldown active until {}",
+                        cooldown_until.to_rfc3339()
+                    ));
+                }
+            }
+        }
+
+        if let Some(limit_bps) = self.config.max_spread_cross_bps {
+            if let Some(actual_bps) = metadata_map_f64(
+                &input.metadata,
+                &["spread_cross_bps", "spread_bps", "quoted_spread_bps"],
+            ) {
+                if actual_bps > limit_bps {
+                    self.cooldown_strategy_locked(&mut guard, input.strategy_id, input.org_id, now);
+                    return Err(format!(
+                        "spread-cross guard tripped: {:.2} bps exceeds {:.2} bps limit",
+                        actual_bps, limit_bps
+                    ));
+                }
+            } else if matches!(input.order_type, OrderType::Market) {
+                // Conservative fallback: market orders without spread context are restricted.
+                self.cooldown_strategy_locked(&mut guard, input.strategy_id, input.org_id, now);
+                return Err(
+                    "spread-cross guard requires spread metadata for market orders".to_string()
+                );
+            }
+        }
+
+        if let Some(limit_bps) = self.config.max_adverse_selection_bps {
+            if let Some(actual_bps) = metadata_map_f64(
+                &input.metadata,
+                &["adverse_selection_bps", "expected_adverse_selection_bps"],
+            ) {
+                if actual_bps > limit_bps {
+                    self.cooldown_strategy_locked(&mut guard, input.strategy_id, input.org_id, now);
+                    return Err(format!(
+                        "adverse-selection guard tripped: {:.2} bps exceeds {:.2} bps limit",
+                        actual_bps, limit_bps
+                    ));
+                }
+            }
+        }
+
+        let org_limit = self.config.org_orders_per_min.max(1);
+        {
+            let org_bucket = guard.org_events.entry(input.org_id).or_default();
+            org_bucket.retain(|ts| *ts >= window_start);
+            if org_bucket.len() >= org_limit {
+                return Err(format!(
+                    "org order-rate limit exceeded: {} orders/min",
+                    org_limit
+                ));
+            }
+        }
+
+        if let Some(strategy_id) = input.strategy_id {
+            let strategy_key = StrategyBucketKey {
+                org_id: input.org_id,
+                strategy_id,
+            };
+            let strategy_limit = self.config.strategy_orders_per_min.max(1);
+            {
+                let strategy_bucket = guard
+                    .strategy_events
+                    .entry(strategy_key.clone())
+                    .or_default();
+                strategy_bucket.retain(|ts| *ts >= window_start);
+                if strategy_bucket.len() >= strategy_limit {
+                    self.cooldown_strategy_locked(&mut guard, Some(strategy_id), input.org_id, now);
+                    return Err(format!(
+                        "strategy order-rate limit exceeded: {} orders/min",
+                        strategy_limit
+                    ));
+                }
+            }
+        }
+
+        let instrument_key = InstrumentBucketKey {
+            org_id: input.org_id,
+            venue: input.venue.clone(),
+            symbol: input.symbol.trim().to_ascii_uppercase(),
+        };
+        let instrument_limit = self.config.instrument_orders_per_min.max(1);
+        {
+            let instrument_bucket = guard
+                .instrument_events
+                .entry(instrument_key.clone())
+                .or_default();
+            instrument_bucket.retain(|ts| *ts >= window_start);
+            if instrument_bucket.len() >= instrument_limit {
+                return Err(format!(
+                    "instrument order-rate limit exceeded: {} orders/min for {}:{}",
+                    instrument_limit,
+                    venue_code(&input.venue),
+                    input.symbol.to_ascii_uppercase()
+                ));
+            }
+        }
+
+        guard.org_events.entry(input.org_id).or_default().push(now_epoch);
+        if let Some(strategy_id) = input.strategy_id {
+            let strategy_key = StrategyBucketKey {
+                org_id: input.org_id,
+                strategy_id,
+            };
+            guard
+                .strategy_events
+                .entry(strategy_key)
+                .or_default()
+                .push(now_epoch);
+        }
+        guard
+            .instrument_events
+            .entry(instrument_key)
+            .or_default()
+            .push(now_epoch);
+        Ok(())
+    }
+
+    fn cooldown_strategy_locked(
+        &self,
+        state: &mut TradeGuardState,
+        strategy_id: Option<uuid::Uuid>,
+        org_id: uuid::Uuid,
+        now: DateTime<Utc>,
+    ) {
+        let Some(strategy_id) = strategy_id else {
+            return;
+        };
+        let until = now + Duration::seconds(self.config.strategy_cooldown_secs.max(5));
+        state.strategy_cooldowns.insert(
+            StrategyBucketKey {
+                org_id,
+                strategy_id,
+            },
+            until,
+        );
     }
 }
 
@@ -195,6 +633,10 @@ struct LiveGuardConfig {
     failure_threshold: u32,
     cooldown_secs: i64,
     require_healthy: bool,
+    slo_window_secs: i64,
+    slo_min_samples: usize,
+    max_rejection_rate: Option<f64>,
+    max_p95_latency_ms: Option<u128>,
 }
 
 impl LiveGuardConfig {
@@ -205,6 +647,12 @@ impl LiveGuardConfig {
             failure_threshold: env_u32("LIVE_GUARD_FAILURE_THRESHOLD", 3),
             cooldown_secs: env_i64("LIVE_GUARD_COOLDOWN_SECS", 120),
             require_healthy: env_bool("LIVE_GUARD_REQUIRE_HEALTHY", true),
+            slo_window_secs: env_i64("LIVE_GUARD_SLO_WINDOW_SECS", 900).max(30),
+            slo_min_samples: env_u32("LIVE_GUARD_SLO_MIN_SAMPLES", 5) as usize,
+            max_rejection_rate: env_optional_positive_f64("LIVE_GUARD_MAX_REJECTION_RATE")
+                .map(|value| value.clamp(0.01, 1.0)),
+            max_p95_latency_ms: env_optional_positive_f64("LIVE_GUARD_MAX_P95_LATENCY_MS")
+                .map(|value| value.max(1.0).round() as u128),
         }
     }
 }
@@ -234,6 +682,7 @@ impl AutomationConfig {
 struct VenueHealthState {
     ok: bool,
     detail: String,
+    latency_ms: Option<u128>,
     checked_at: DateTime<Utc>,
 }
 
@@ -243,6 +692,8 @@ struct VenueLiveGuardState {
     consecutive_live_failures: u32,
     breaker_open_until: Option<DateTime<Utc>>,
     last_health: Option<VenueHealthState>,
+    live_result_samples: Vec<(DateTime<Utc>, bool)>,
+    health_latency_samples: Vec<(DateTime<Utc>, u128)>,
     updated_at: DateTime<Utc>,
 }
 
@@ -261,6 +712,10 @@ struct LiveGuardConfigView {
     failure_threshold: u32,
     cooldown_secs: i64,
     health_poll_interval_secs: u64,
+    slo_window_secs: i64,
+    slo_min_samples: usize,
+    max_rejection_rate: Option<f64>,
+    max_p95_latency_ms: Option<u128>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -281,7 +736,12 @@ struct LiveGuardVenueView {
     breaker_open_until: Option<DateTime<Utc>>,
     last_health_ok: Option<bool>,
     last_health_detail: Option<String>,
+    last_health_latency_ms: Option<u128>,
     last_health_at: Option<DateTime<Utc>>,
+    rejection_rate: Option<f64>,
+    health_latency_p95_ms: Option<u128>,
+    slo_blocked: bool,
+    slo_block_reason: Option<String>,
     updated_at: DateTime<Utc>,
 }
 
@@ -312,6 +772,8 @@ impl LiveExecutionGuard {
                     consecutive_live_failures: 0,
                     breaker_open_until: None,
                     last_health: None,
+                    live_result_samples: Vec::new(),
+                    health_latency_samples: Vec::new(),
                     updated_at: now,
                 },
             );
@@ -398,6 +860,15 @@ impl LiveExecutionGuard {
             }
         }
 
+        let (slo_blocked, slo_reason, _, _) = self.slo_status_locked(venue_state, now);
+        if slo_blocked {
+            return Err(format!(
+                "live execution blocked: venue {} SLO guard ({})",
+                venue_code(venue),
+                slo_reason.unwrap_or_else(|| "threshold breached".to_string())
+            ));
+        }
+
         Ok(())
     }
 
@@ -406,6 +877,7 @@ impl LiveExecutionGuard {
         venue: &Venue,
         ok: bool,
         detail: String,
+        latency_ms: Option<u128>,
         checked_at: DateTime<Utc>,
     ) -> Result<bool> {
         let mut guard = self
@@ -419,13 +891,22 @@ impl LiveExecutionGuard {
             ));
         };
         let changed = match &venue_state.last_health {
-            Some(existing) => existing.ok != ok || existing.detail != detail,
+            Some(existing) => {
+                existing.ok != ok
+                    || existing.detail != detail
+                    || existing.latency_ms != latency_ms
+            }
             None => true,
         };
 
+        self.prune_slo_samples_locked(venue_state, Utc::now());
+        if let Some(latency) = latency_ms {
+            venue_state.health_latency_samples.push((checked_at, latency));
+        }
         venue_state.last_health = Some(VenueHealthState {
             ok,
             detail,
+            latency_ms,
             checked_at,
         });
         venue_state.updated_at = Utc::now();
@@ -437,6 +918,7 @@ impl LiveExecutionGuard {
         venue: &Venue,
         success: bool,
         detail: &str,
+        latency_ms: Option<u128>,
     ) -> Result<Option<String>> {
         let mut guard = self
             .state
@@ -450,6 +932,11 @@ impl LiveExecutionGuard {
         };
 
         let now = Utc::now();
+        self.prune_slo_samples_locked(venue_state, now);
+        venue_state.live_result_samples.push((now, success));
+        if let Some(latency) = latency_ms {
+            venue_state.health_latency_samples.push((now, latency));
+        }
         if success {
             let had_failures = venue_state.consecutive_live_failures > 0
                 || venue_state.breaker_open_until.is_some();
@@ -557,6 +1044,8 @@ impl LiveExecutionGuard {
             .map(|(venue, venue_state)| {
                 let (live_allowed_now, block_reason) =
                     self.venue_access_status_locked(state, venue, venue_state, now);
+                let (slo_blocked, slo_block_reason, rejection_rate, health_latency_p95_ms) =
+                    self.slo_status_locked(venue_state, now);
                 LiveGuardVenueView {
                     venue: venue_code(venue),
                     live_enabled: venue_state.live_enabled,
@@ -570,7 +1059,15 @@ impl LiveExecutionGuard {
                     breaker_open_until: venue_state.breaker_open_until,
                     last_health_ok: venue_state.last_health.as_ref().map(|v| v.ok),
                     last_health_detail: venue_state.last_health.as_ref().map(|v| v.detail.clone()),
+                    last_health_latency_ms: venue_state
+                        .last_health
+                        .as_ref()
+                        .and_then(|v| v.latency_ms),
                     last_health_at: venue_state.last_health.as_ref().map(|v| v.checked_at),
+                    rejection_rate,
+                    health_latency_p95_ms,
+                    slo_blocked,
+                    slo_block_reason,
                     updated_at: venue_state.updated_at,
                 }
             })
@@ -584,6 +1081,10 @@ impl LiveExecutionGuard {
                 failure_threshold: self.config.failure_threshold.max(1),
                 cooldown_secs: self.config.cooldown_secs.max(5),
                 health_poll_interval_secs: self.poll_interval_secs(),
+                slo_window_secs: self.config.slo_window_secs.max(30),
+                slo_min_samples: self.config.slo_min_samples.max(1),
+                max_rejection_rate: self.config.max_rejection_rate,
+                max_p95_latency_ms: self.config.max_p95_latency_ms,
             },
             global: LiveGuardGlobalView {
                 kill_switch_enabled: state.kill_switch_enabled,
@@ -645,8 +1146,91 @@ impl LiveExecutionGuard {
             }
         }
 
+        let (slo_blocked, slo_reason, _, _) = self.slo_status_locked(venue_state, now);
+        if slo_blocked {
+            return (
+                false,
+                Some(slo_reason.unwrap_or_else(|| "SLO guard tripped".to_string())),
+            );
+        }
+
         let _ = venue;
         (true, None)
+    }
+
+    fn prune_slo_samples_locked(&self, venue_state: &mut VenueLiveGuardState, now: DateTime<Utc>) {
+        let cutoff = now - Duration::seconds(self.config.slo_window_secs.max(30));
+        venue_state
+            .live_result_samples
+            .retain(|(at, _)| *at >= cutoff);
+        venue_state
+            .health_latency_samples
+            .retain(|(at, _)| *at >= cutoff);
+    }
+
+    fn slo_status_locked(
+        &self,
+        venue_state: &VenueLiveGuardState,
+        now: DateTime<Utc>,
+    ) -> (bool, Option<String>, Option<f64>, Option<u128>) {
+        let cutoff = now - Duration::seconds(self.config.slo_window_secs.max(30));
+        let min_samples = self.config.slo_min_samples.max(1);
+
+        let results: Vec<bool> = venue_state
+            .live_result_samples
+            .iter()
+            .filter(|(at, _)| *at >= cutoff)
+            .map(|(_, success)| *success)
+            .collect();
+        let latencies: Vec<u128> = venue_state
+            .health_latency_samples
+            .iter()
+            .filter(|(at, _)| *at >= cutoff)
+            .map(|(_, latency_ms)| *latency_ms)
+            .collect();
+
+        let rejection_rate = if results.len() >= min_samples {
+            let rejects = results.iter().filter(|ok| !**ok).count() as f64;
+            Some(rejects / results.len() as f64)
+        } else {
+            None
+        };
+        let p95_latency = if latencies.len() >= min_samples {
+            percentile_u128(latencies, 0.95)
+        } else {
+            None
+        };
+
+        if let (Some(limit), Some(actual)) = (self.config.max_rejection_rate, rejection_rate) {
+            if actual > limit {
+                return (
+                    true,
+                    Some(format!(
+                        "rejection rate {:.2}% exceeds {:.2}% limit",
+                        actual * 100.0,
+                        limit * 100.0
+                    )),
+                    rejection_rate,
+                    p95_latency,
+                );
+            }
+        }
+
+        if let (Some(limit), Some(actual)) = (self.config.max_p95_latency_ms, p95_latency) {
+            if actual > limit {
+                return (
+                    true,
+                    Some(format!(
+                        "p95 latency {}ms exceeds {}ms limit",
+                        actual, limit
+                    )),
+                    rejection_rate,
+                    p95_latency,
+                );
+            }
+        }
+
+        (false, None, rejection_rate, p95_latency)
     }
 }
 
@@ -730,6 +1314,62 @@ struct ApiOrderInput {
     mode: Option<ExecutionMode>,
     #[serde(default)]
     strategy_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    metadata: Option<indexmap::IndexMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SliceOrderInput {
+    venue: String,
+    symbol: String,
+    #[serde(default)]
+    asset_class: Option<AssetClass>,
+    #[serde(default)]
+    quote_currency: Option<String>,
+    side: Side,
+    quantity: f64,
+    #[serde(default)]
+    limit_price: Option<f64>,
+    #[serde(default)]
+    mode: Option<ExecutionMode>,
+    #[serde(default)]
+    strategy_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    order_type: Option<OrderType>,
+    #[serde(default)]
+    time_in_force: Option<TimeInForce>,
+    algorithm: slicing::SliceAlgorithm,
+    #[serde(default)]
+    duration_secs: Option<u64>,
+    #[serde(default)]
+    child_count: Option<usize>,
+    #[serde(default)]
+    participation_rate: Option<f64>,
+    #[serde(default)]
+    visible_fraction: Option<f64>,
+    #[serde(default)]
+    depth_usd: Option<f64>,
+    #[serde(default)]
+    spread_bps: Option<f64>,
+    #[serde(default)]
+    queue_ahead_qty: Option<f64>,
+    #[serde(default)]
+    target_child_notional_usd: Option<f64>,
+    #[serde(default)]
+    min_child_qty: Option<f64>,
+    #[serde(default)]
+    max_child_qty: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+struct SliceSubmitChildResult {
+    child_index: usize,
+    offset_ms: u64,
+    quantity: f64,
+    limit_price: f64,
+    request_id: Option<uuid::Uuid>,
+    status: Option<OrderStatus>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -742,6 +1382,121 @@ struct ClosePositionInput {
 
 #[derive(Debug, Deserialize)]
 struct RecentOrdersQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DecisionTraceQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    strategy_id: Option<uuid::Uuid>,
+    #[serde(default)]
+    venue: Option<String>,
+    #[serde(default)]
+    mode: Option<ExecutionMode>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelemetrySummaryQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    lookback_hours: Option<i64>,
+    #[serde(default)]
+    strategy_id: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignalOntologyQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    tradable_only: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignalDislocationQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    min_spread_bps: Option<f64>,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    include_stale: Option<bool>,
+    #[serde(default)]
+    max_quote_age_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResearchRunsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    strategy_id: Option<uuid::Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateResearchRunInput {
+    #[serde(default)]
+    strategy_id: Option<uuid::Uuid>,
+    dataset_snapshot_id: String,
+    feature_set_hash: String,
+    code_version: String,
+    config_hash: String,
+    #[serde(default)]
+    baseline_run_id: Option<uuid::Uuid>,
+    metrics: ResearchMetrics,
+    #[serde(default)]
+    artifact_uri: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DecisionTraceView {
+    request_id: uuid::Uuid,
+    user_id: uuid::Uuid,
+    strategy_id: Option<uuid::Uuid>,
+    venue: String,
+    symbol: String,
+    recorded_at: DateTime<Utc>,
+    trace: oms::DecisionTrace,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct UpsertCanonicalInstrumentInput {
+    canonical_event_id: String,
+    canonical_outcome_id: String,
+    #[serde(default)]
+    canonical_event_title: Option<String>,
+    outcome_label: String,
+    venue: String,
+    symbol: String,
+    #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
+    lifecycle: Option<domain::InstrumentLifecycle>,
+    #[serde(default)]
+    manual_override: Option<bool>,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct InstrumentRegistryQuery {
+    #[serde(default)]
+    venue: Option<String>,
+    #[serde(default)]
+    symbol: Option<String>,
+    #[serde(default)]
+    canonical_event_id: Option<String>,
+    #[serde(default)]
+    lifecycle: Option<domain::InstrumentLifecycle>,
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -781,6 +1536,57 @@ struct IntelTagsQuery {
 struct OrchestratorEvaluateInput {
     #[serde(default)]
     use_intel_signals: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestratorStartRolloutInput {
+    champion_id: uuid::Uuid,
+    challenger_id: uuid::Uuid,
+    #[serde(default)]
+    shadow_allocation_usd: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestratorCapitalAllocateInput {
+    #[serde(default)]
+    total_capital_override_usd: Option<f64>,
+    #[serde(default)]
+    regime: Option<orchestrator::MarketRegime>,
+    #[serde(default)]
+    min_allocation_floor_usd: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestratorEnsemblePolicyInput {
+    microstructure_score: f64,
+    event_probability_score: f64,
+    risk_allocator_score: f64,
+    #[serde(default)]
+    micro_weight: Option<f64>,
+    #[serde(default)]
+    event_weight: Option<f64>,
+    #[serde(default)]
+    risk_weight: Option<f64>,
+    #[serde(default)]
+    policy_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestratorSnapshotsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrchestratorReplayInput {
+    snapshot_id: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct OrchestratorSnapshotHistoryView {
+    snapshot_id: i64,
+    created_at: DateTime<Utc>,
+    snapshot: orchestrator::OrchestratorSnapshot,
 }
 
 #[derive(Debug, Deserialize)]
@@ -936,11 +1742,23 @@ async fn main() -> Result<()> {
     let auth = build_auth_store_from_env()?;
 
     let allow_live = env_bool("LIVE_TRADING_ENABLED", false);
+    let max_quote_age_secs = env_i64("PRETRADE_MAX_QUOTE_AGE_SECS", 30);
+    let max_spread_bps = env_optional_f64("RISK_MAX_SPREAD_BPS")
+        .filter(|value| value.is_finite() && *value > 0.0);
     let default_mode =
         parse_mode(std::env::var("EXECUTION_MODE").unwrap_or_else(|_| "paper".to_string()))?;
     let starting_cash = env_f64("SIM_STARTING_CASH_USD", 50_000.0);
     let risk = RiskEngine::new(RiskLimits {
         allow_live,
+        dynamic_limits_enabled: env_bool("RISK_DYNAMIC_LIMITS_ENABLED", true),
+        target_volatility_bps: env_f64("RISK_TARGET_VOLATILITY_BPS", 80.0).max(1.0),
+        target_top_of_book_liquidity_usd: env_f64("RISK_TARGET_TOP_BOOK_LIQ_USD", 10_000.0)
+            .max(1.0),
+        liquidity_take_fraction: env_f64("RISK_LIQUIDITY_TAKE_FRACTION", 0.20).clamp(0.01, 1.0),
+        min_order_limit_factor: env_f64("RISK_MIN_ORDER_LIMIT_FACTOR", 0.10).clamp(0.01, 1.0),
+        min_position_limit_factor: env_f64("RISK_MIN_POSITION_LIMIT_FACTOR", 0.25)
+            .clamp(0.01, 1.0),
+        max_spread_bps,
         ..RiskLimits::default()
     });
     let audit_dir = std::env::var("OMS_AUDIT_DIR")
@@ -960,6 +1778,12 @@ async fn main() -> Result<()> {
             live_trading_enabled: allow_live,
             shadow_reads_enabled: env_bool("SHADOW_READS_ENABLED", true),
             simulated_fee_bps: env_f64("SIM_FEE_BPS", 2.0),
+            require_quote_for_market_data_modes: env_bool("PRETRADE_REQUIRE_QUOTE", true),
+            max_quote_age_secs: if max_quote_age_secs > 0 {
+                Some(max_quote_age_secs)
+            } else {
+                None
+            },
         },
         registry.clone(),
         risk,
@@ -1254,12 +2078,22 @@ fn spawn_live_guard_probe(
             interval.tick().await;
             for adapter in registry.all() {
                 let venue = adapter.venue();
-                let (ok, detail, checked_at) = match adapter.health().await {
-                    Ok(report) => (report.ok, report.detail, report.checked_at),
-                    Err(err) => (false, format!("health probe error: {err}"), Utc::now()),
+                let (ok, detail, latency_ms, checked_at) = match adapter.health().await {
+                    Ok(report) => (
+                        report.ok,
+                        report.detail,
+                        Some(report.latency_ms),
+                        report.checked_at,
+                    ),
+                    Err(err) => (
+                        false,
+                        format!("health probe error: {err}"),
+                        None,
+                        Utc::now(),
+                    ),
                 };
 
-                match live_guard.note_health(&venue, ok, detail.clone(), checked_at) {
+                match live_guard.note_health(&venue, ok, detail.clone(), latency_ms, checked_at) {
                     Ok(changed) => {
                         if changed {
                             if let Ok(snapshot) = live_guard.snapshot() {
@@ -1270,6 +2104,7 @@ fn spawn_live_guard_probe(
                                         "venue": venue_code(&venue),
                                         "ok": ok,
                                         "detail": detail,
+                                        "latency_ms": latency_ms,
                                         "snapshot": snapshot
                                     }),
                                 );
@@ -1425,6 +2260,8 @@ async fn serve_api(
     let live_guard = LiveExecutionGuard::new(oms.configured_venues(), LiveGuardConfig::from_env());
     let intel = intel::SocialIntelStore::new_from_env();
     let orchestrator = StrategyOrchestrator::new(OrchestratorConfig::from_env());
+    let registry = InstrumentRegistryStore::default();
+    let research = ResearchRunStore::default();
     let event_bus = EventBus::new(env_u32("STREAM_EVENT_BUFFER", 512) as usize);
     let state = AppState {
         oms,
@@ -1432,9 +2269,12 @@ async fn serve_api(
         default_mode,
         db,
         rate_limiter: OrgRateLimiter::new(env_u32("ORG_RATE_LIMIT_PER_MIN", 600) as usize),
+        trade_guard: HierarchicalTradeGuard::new(TradeGuardConfig::from_env()),
         live_guard: live_guard.clone(),
         intel,
         orchestrator,
+        registry,
+        research,
         event_bus: event_bus.clone(),
     };
     if let Err(err) = hydrate_automation_state(&state).await {
@@ -1445,23 +2285,57 @@ async fn serve_api(
 
     let protected = Router::new()
         .route("/v1/orders", post(api_place_order))
+        .route("/v1/orders/:request_id/explain", get(api_explain_order))
         .route("/v1/positions/close", post(api_close_position))
         .route("/v1/portfolio", get(api_get_portfolio))
         .route("/v1/portfolio/history", get(api_portfolio_history))
         .route("/v1/orders/recent", get(api_recent_orders))
+        .route("/v1/telemetry/summary", get(api_telemetry_summary))
+        .route("/v1/signals/ontology", get(api_get_signal_ontology))
+        .route("/v1/signals/dislocations", get(api_get_signal_dislocations))
+        .route("/v1/decision-traces", get(api_recent_decision_traces))
+        .route(
+            "/v1/instruments/registry",
+            get(api_list_instrument_registry).post(api_upsert_instrument_registry),
+        )
+        .route("/v1/execution/slice/plan", post(api_plan_slice_order))
+        .route("/v1/execution/slice/submit", post(api_submit_slice_order))
         .route(
             "/v1/intel/claims",
             get(api_get_intel_claims).post(api_add_intel_claim),
         )
         .route("/v1/intel/scan", post(api_run_intel_scan))
         .route("/v1/intel/tags", get(api_get_intel_tags))
+        .route(
+            "/v1/research/runs",
+            get(api_list_research_runs).post(api_create_research_run),
+        )
+        .route("/v1/research/runs/:run_id", get(api_get_research_run))
         .route("/v1/orchestrator", get(api_get_orchestrator))
         .route("/v1/orchestrator/agents", post(api_upsert_strategy_agent))
         .route(
             "/v1/orchestrator/agents/:agent_id/performance",
             post(api_set_strategy_performance),
         )
+        .route(
+            "/v1/orchestrator/agents/:agent_id/ensemble-policy",
+            post(api_set_strategy_ensemble_policy),
+        )
         .route("/v1/orchestrator/evaluate", post(api_evaluate_orchestrator))
+        .route(
+            "/v1/orchestrator/capital-allocate",
+            post(api_allocate_orchestrator_capital),
+        )
+        .route("/v1/orchestrator/snapshots", get(api_list_orchestrator_snapshots))
+        .route("/v1/orchestrator/replay", post(api_replay_orchestrator_snapshot))
+        .route(
+            "/v1/orchestrator/rollouts",
+            get(api_get_orchestrator_rollouts).post(api_start_orchestrator_rollout),
+        )
+        .route(
+            "/v1/orchestrator/rollouts/evaluate",
+            post(api_evaluate_orchestrator_rollouts),
+        )
         .route("/v1/execution/guards", get(api_get_live_guards))
         .route(
             "/v1/execution/guards/kill-switch",
@@ -1681,6 +2555,279 @@ async fn api_place_order(
     submit_order_from_input(&state, &identity, payload).await
 }
 
+async fn api_plan_slice_order(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<SliceOrderInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow planning sliced orders".to_string(),
+        );
+    }
+
+    match build_slice_plan(&state, &identity, &payload).await {
+        Ok((plan, _, _)) => (StatusCode::OK, Json(serde_json::json!({ "plan": plan }))).into_response(),
+        Err(response) => response,
+    }
+}
+
+async fn api_submit_slice_order(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<SliceOrderInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow placing orders".to_string(),
+        );
+    }
+
+    let (plan, venue, requested_mode) = match build_slice_plan(&state, &identity, &payload).await {
+        Ok(values) => values,
+        Err(response) => return response,
+    };
+    if plan.children.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "slice plan produced zero child orders".to_string(),
+        );
+    }
+
+    let oms = match state.oms.for_org(identity.org_id) {
+        Ok(oms) => oms,
+        Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    let parent_id = uuid::Uuid::new_v4();
+    let order_type = payload.order_type.unwrap_or(OrderType::Limit);
+    let time_in_force = payload.time_in_force.unwrap_or(TimeInForce::Day);
+
+    let mut results: Vec<SliceSubmitChildResult> = Vec::with_capacity(plan.children.len());
+    for child in &plan.children {
+        let mut metadata = indexmap::IndexMap::new();
+        metadata.insert("slice_parent_id".to_string(), parent_id.to_string());
+        metadata.insert(
+            "slice_algorithm".to_string(),
+            format!("{:?}", payload.algorithm).to_ascii_lowercase(),
+        );
+        metadata.insert("slice_child_index".to_string(), child.child_index.to_string());
+        metadata.insert("slice_offset_ms".to_string(), child.offset_ms.to_string());
+        metadata.insert(
+            "slice_expected_fill_prob".to_string(),
+            format!("{:.4}", child.expected_fill_probability),
+        );
+        metadata.insert(
+            "slice_rationale".to_string(),
+            child.rationale.chars().take(240).collect(),
+        );
+        if let Some(spread_bps) = payload.spread_bps {
+            metadata.insert("spread_bps".to_string(), format!("{spread_bps:.4}"));
+        }
+        if let Some(depth_usd) = payload.depth_usd {
+            metadata.insert("top_of_book_liquidity_usd".to_string(), format!("{depth_usd:.4}"));
+        }
+        if let Err(reason) = state.trade_guard.authorize_and_record(&TradeGuardInput {
+            org_id: identity.org_id,
+            strategy_id: payload.strategy_id,
+            venue: venue.clone(),
+            symbol: payload.symbol.clone(),
+            order_type,
+            metadata: metadata.clone(),
+            now: Utc::now(),
+        }) {
+            results.push(SliceSubmitChildResult {
+                child_index: child.child_index,
+                offset_ms: child.offset_ms,
+                quantity: child.quantity,
+                limit_price: child.limit_price,
+                request_id: None,
+                status: None,
+                error: Some(reason),
+            });
+            if matches!(requested_mode, ExecutionMode::Live) {
+                break;
+            }
+            continue;
+        }
+
+        let order = OrderRequest {
+            request_id: uuid::Uuid::new_v4(),
+            user_id: identity.user_id,
+            strategy_id: payload.strategy_id,
+            mode: requested_mode,
+            instrument: Instrument {
+                venue: venue.clone(),
+                symbol: payload.symbol.clone(),
+                asset_class: payload
+                    .asset_class
+                    .unwrap_or_else(|| default_asset_class(&venue)),
+                quote_currency: payload
+                    .quote_currency
+                    .clone()
+                    .unwrap_or_else(|| "USD".to_string())
+                    .to_uppercase(),
+            },
+            side: payload.side,
+            order_type,
+            time_in_force,
+            quantity: child.quantity,
+            limit_price: Some(child.limit_price),
+            submitted_at: Utc::now(),
+            metadata,
+        };
+
+        match oms.submit_order_with_audit(order).await {
+            Ok((ack, record)) => {
+                if matches!(ack.mode, ExecutionMode::Live) {
+                    let live_ok = matches!(ack.status, OrderStatus::Accepted);
+                    let _ = state
+                        .live_guard
+                        .record_live_result(&venue, live_ok, &ack.message, None);
+                }
+                if let Some(db) = &state.db {
+                    if let Err(err) = db
+                        .insert_order_audit(identity.org_id, identity.user_id, &record)
+                        .await
+                    {
+                        warn!(
+                            request_id = %ack.request_id,
+                            error = %err,
+                            "failed to persist sliced order audit to postgres"
+                        );
+                    }
+                }
+                results.push(SliceSubmitChildResult {
+                    child_index: child.child_index,
+                    offset_ms: child.offset_ms,
+                    quantity: child.quantity,
+                    limit_price: child.limit_price,
+                    request_id: Some(ack.request_id),
+                    status: Some(ack.status),
+                    error: None,
+                });
+            }
+            Err(err) => {
+                results.push(SliceSubmitChildResult {
+                    child_index: child.child_index,
+                    offset_ms: child.offset_ms,
+                    quantity: child.quantity,
+                    limit_price: child.limit_price,
+                    request_id: None,
+                    status: None,
+                    error: Some(err.to_string()),
+                });
+                if matches!(requested_mode, ExecutionMode::Live) {
+                    break;
+                }
+            }
+        }
+    }
+
+    let succeeded = results.iter().filter(|entry| entry.error.is_none()).count();
+    let failed = results.len().saturating_sub(succeeded);
+    let attempted_quantity: f64 = results.iter().map(|entry| entry.quantity).sum();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "parent_id": parent_id,
+            "plan": plan,
+            "results": results,
+            "summary": {
+                "children_attempted": succeeded + failed,
+                "children_succeeded": succeeded,
+                "children_failed": failed,
+                "attempted_quantity": attempted_quantity
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn build_slice_plan(
+    state: &AppState,
+    identity: &ApiIdentity,
+    payload: &SliceOrderInput,
+) -> Result<(slicing::SlicePlan, Venue, ExecutionMode), Response> {
+    if payload.quantity <= 0.0 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "quantity must be positive for sliced orders".to_string(),
+        ));
+    }
+
+    let venue = parse_venue(payload.venue.clone())
+        .map_err(|err| api_error(StatusCode::BAD_REQUEST, err.to_string()))?;
+    enforce_registry_lifecycle(state, identity.org_id, &venue, &payload.symbol).await?;
+    let requested_mode = payload.mode.unwrap_or(state.default_mode);
+    if matches!(requested_mode, ExecutionMode::Live) && !identity.role.can_request_live() {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "only admin role can request live mode".to_string(),
+        ));
+    }
+    if matches!(requested_mode, ExecutionMode::Live) {
+        state
+            .live_guard
+            .authorize_live(&venue, Utc::now())
+            .map_err(|reason| api_error(StatusCode::FORBIDDEN, reason))?;
+    }
+
+    let adapter = state
+        .oms
+        .adapter_registry()
+        .get(&venue)
+        .map_err(|err| api_error(StatusCode::BAD_REQUEST, err.to_string()))?;
+
+    let quote = adapter.fetch_quote(&payload.symbol).await.ok();
+    let inferred_price = quote
+        .as_ref()
+        .and_then(|snapshot| snapshot.last.or(snapshot.bid).or(snapshot.ask));
+    let reference_price = payload.limit_price.or(inferred_price).ok_or_else(|| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "limit_price is required when no quote is available".to_string(),
+        )
+    })?;
+    let spread_bps = payload
+        .spread_bps
+        .or_else(|| quote.as_ref().and_then(compute_spread_bps));
+
+    let plan = slicing::plan_slice(&slicing::SlicePlanConfig {
+        algorithm: payload.algorithm,
+        side: payload.side,
+        total_quantity: payload.quantity,
+        reference_price,
+        duration_secs: payload.duration_secs.unwrap_or(60),
+        child_count: payload.child_count,
+        participation_rate: payload.participation_rate,
+        visible_fraction: payload.visible_fraction,
+        depth_usd: payload.depth_usd,
+        spread_bps,
+        queue_ahead_qty: payload.queue_ahead_qty,
+        target_child_notional_usd: payload.target_child_notional_usd,
+        min_child_qty: payload.min_child_qty,
+        max_child_qty: payload.max_child_qty,
+    });
+
+    Ok((plan, venue, requested_mode))
+}
+
+fn compute_spread_bps(quote: &domain::MarketQuote) -> Option<f64> {
+    let bid = quote.bid?;
+    let ask = quote.ask?;
+    if bid <= 0.0 || ask <= 0.0 || ask < bid {
+        return None;
+    }
+    let mid = (bid + ask) / 2.0;
+    if mid <= 0.0 {
+        return None;
+    }
+    Some(((ask - bid) / mid) * 10_000.0)
+}
+
 async fn api_close_position(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
@@ -1743,6 +2890,7 @@ async fn api_close_position(
         limit_price: position.market_price.or(Some(position.average_price)),
         mode: payload.mode,
         strategy_id: None,
+        metadata: None,
     };
     submit_order_from_input(&state, &identity, close_payload).await
 }
@@ -1752,10 +2900,19 @@ async fn submit_order_from_input(
     identity: &ApiIdentity,
     payload: ApiOrderInput,
 ) -> Response {
+    let requested_symbol = payload.symbol.clone();
+    let requested_strategy_id = payload.strategy_id;
+    let requested_order_type = payload.order_type;
+    let requested_metadata = payload.metadata.unwrap_or_default();
     let venue = match parse_venue(payload.venue) {
         Ok(v) => v,
         Err(err) => return api_error(StatusCode::BAD_REQUEST, err.to_string()),
     };
+    if let Err(response) =
+        enforce_registry_lifecycle(state, identity.org_id, &venue, &requested_symbol).await
+    {
+        return response;
+    }
     let requested_mode = payload.mode.unwrap_or(state.default_mode);
     if matches!(requested_mode, ExecutionMode::Live) && !identity.role.can_request_live() {
         return api_error(
@@ -1768,11 +2925,30 @@ async fn submit_order_from_input(
             return api_error(StatusCode::FORBIDDEN, reason);
         }
     }
+    if let Err(reason) = state.trade_guard.authorize_and_record(&TradeGuardInput {
+        org_id: identity.org_id,
+        strategy_id: requested_strategy_id,
+        venue: venue.clone(),
+        symbol: requested_symbol.clone(),
+        order_type: requested_order_type,
+        metadata: requested_metadata.clone(),
+        now: Utc::now(),
+    }) {
+        let status = if reason.contains("limit")
+            || reason.contains("cooldown")
+            || reason.contains("rate")
+        {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        return api_error(status, reason);
+    }
 
     let order = OrderRequest {
         request_id: uuid::Uuid::new_v4(),
         user_id: identity.user_id,
-        strategy_id: payload.strategy_id,
+        strategy_id: requested_strategy_id,
         mode: requested_mode,
         instrument: Instrument {
             venue: venue.clone(),
@@ -1786,12 +2962,12 @@ async fn submit_order_from_input(
                 .to_uppercase(),
         },
         side: payload.side,
-        order_type: payload.order_type,
+        order_type: requested_order_type,
         time_in_force: payload.time_in_force.unwrap_or(TimeInForce::Day),
         quantity: payload.quantity,
         limit_price: payload.limit_price,
         submitted_at: Utc::now(),
-        metadata: Default::default(),
+        metadata: requested_metadata,
     };
 
     let oms = match state.oms.for_org(identity.org_id) {
@@ -1805,7 +2981,7 @@ async fn submit_order_from_input(
                 let live_ok = matches!(ack.status, OrderStatus::Accepted);
                 match state
                     .live_guard
-                    .record_live_result(&venue, live_ok, &ack.message)
+                    .record_live_result(&venue, live_ok, &ack.message, None)
                 {
                     Ok(Some(guard_event)) => {
                         if let Ok(snapshot) = state.live_guard.snapshot() {
@@ -1906,7 +3082,7 @@ async fn submit_order_from_input(
                 let err_detail = err.to_string();
                 match state
                     .live_guard
-                    .record_live_result(&venue, false, &err_detail)
+                    .record_live_result(&venue, false, &err_detail, None)
                 {
                     Ok(Some(guard_event)) => {
                         if let Ok(snapshot) = state.live_guard.snapshot() {
@@ -2013,6 +3189,838 @@ async fn api_recent_orders(
             .into_response(),
         Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
     }
+}
+
+async fn api_explain_order(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(request_id): Path<uuid::Uuid>,
+) -> impl IntoResponse {
+    let record = if let Some(db) = &state.db {
+        match db.order_audit_by_request_id(identity.org_id, request_id).await {
+            Ok(record) => record,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    } else {
+        let oms = match state.oms.for_org(identity.org_id) {
+            Ok(oms) => oms,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        };
+        match oms.recent_audit_records(2_000) {
+            Ok(records) => records
+                .into_iter()
+                .find(|entry| entry.order.request_id == request_id),
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    };
+
+    let Some(record) = record else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            format!("order audit not found for request_id={request_id}"),
+        );
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "request_id": request_id,
+            "explanation": build_order_explanation(&record),
+            "recorded_at": record.recorded_at
+        })),
+    )
+        .into_response()
+}
+
+fn build_order_explanation(record: &OrderAuditRecord) -> serde_json::Value {
+    let mut highlights: Vec<String> = Vec::new();
+    highlights.push(format!(
+        "requested_mode={} effective_mode={} status={}",
+        mode_code(record.decision.requested),
+        mode_code(record.decision.effective),
+        order_status_code(record.ack.status)
+    ));
+    if let Some(reason) = &record.decision.reason {
+        highlights.push(format!("mode_decision_reason={reason}"));
+    }
+
+    if let Some(trace) = &record.decision_trace {
+        if let Some(confidence) = trace.signal.confidence {
+            highlights.push(format!("signal_confidence={confidence:.3}"));
+        }
+        if let Some(age) = trace.risk.quote_age_secs {
+            highlights.push(format!("quote_age_secs={age}"));
+        }
+        if let Some(spread) = trace.risk.checks.spread_bps {
+            highlights.push(format!("spread_bps={spread:.2}"));
+        }
+        highlights.push(format!(
+            "effective_order_limit={:.2} effective_position_limit={:.2}",
+            trace.risk.checks.effective_max_order_notional,
+            trace.risk.checks.effective_max_position_notional
+        ));
+        highlights.push(format!("execution_message={}", trace.execution.message));
+    }
+
+    serde_json::json!({
+        "order": {
+            "request_id": record.order.request_id,
+            "user_id": record.order.user_id,
+            "strategy_id": record.order.strategy_id,
+            "venue": venue_code(&record.order.instrument.venue),
+            "symbol": &record.order.instrument.symbol,
+            "side": &record.order.side,
+            "order_type": &record.order.order_type,
+            "quantity": record.order.quantity,
+            "limit_price": record.order.limit_price,
+            "submitted_at": record.order.submitted_at,
+            "metadata": &record.order.metadata
+        },
+        "mode_decision": &record.decision,
+        "ack": &record.ack,
+        "trace": &record.decision_trace,
+        "highlights": highlights
+    })
+}
+
+async fn api_telemetry_summary(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Query(query): Query<TelemetrySummaryQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(500).clamp(10, 5_000);
+    let lookback_hours = query.lookback_hours.unwrap_or(24).clamp(1, 24 * 30);
+    let cutoff = Utc::now() - Duration::hours(lookback_hours);
+
+    let records = if let Some(db) = &state.db {
+        match db.recent_order_audits(identity.org_id, limit).await {
+            Ok(records) => records,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    } else {
+        let oms = match state.oms.for_org(identity.org_id) {
+            Ok(oms) => oms,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        };
+        match oms.recent_audit_records(limit) {
+            Ok(records) => records,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    };
+
+    let filtered: Vec<OrderAuditRecord> = records
+        .into_iter()
+        .filter(|record| record.recorded_at >= cutoff)
+        .filter(|record| {
+            query
+                .strategy_id
+                .map(|strategy_id| record.order.strategy_id == Some(strategy_id))
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "lookback_hours": lookback_hours,
+                "record_count": 0,
+                "metrics": {
+                    "fill_efficiency": null,
+                    "avg_signal_confidence": null,
+                    "avg_slippage_bps": null,
+                    "edge_decay_bps": null
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    let total = filtered.len();
+    let executed = filtered
+        .iter()
+        .filter(|record| matches!(record.ack.status, OrderStatus::Accepted | OrderStatus::Simulated))
+        .count();
+    let rejected = filtered
+        .iter()
+        .filter(|record| matches!(record.ack.status, OrderStatus::Rejected))
+        .count();
+
+    let confidences: Vec<f64> = filtered
+        .iter()
+        .filter_map(|record| {
+            record
+                .decision_trace
+                .as_ref()
+                .and_then(|trace| trace.signal.confidence)
+        })
+        .collect();
+
+    let slippage_bps_samples: Vec<f64> = filtered
+        .iter()
+        .filter_map(|record| {
+            let trace = record.decision_trace.as_ref()?;
+            let reference_price = trace.risk.reference_price?;
+            let execution_price = record
+                .order
+                .limit_price
+                .or(trace.risk.reference_price)
+                .filter(|value| *value > 0.0)?;
+            if reference_price <= 0.0 {
+                return None;
+            }
+            Some(((execution_price - reference_price) / reference_price) * 10_000.0)
+        })
+        .collect();
+
+    let edge_decay_samples: Vec<f64> = filtered
+        .iter()
+        .filter_map(|record| {
+            let expected = metadata_map_f64(&record.order.metadata, &["expected_edge_bps"])?;
+            let realized = metadata_map_f64(&record.order.metadata, &["realized_edge_bps"])?;
+            Some(expected - realized)
+        })
+        .collect();
+
+    let fill_efficiency = executed as f64 / total as f64;
+    let avg_signal_confidence = mean_f64(&confidences);
+    let avg_slippage_bps = mean_f64(&slippage_bps_samples);
+    let edge_decay_bps = mean_f64(&edge_decay_samples);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "lookback_hours": lookback_hours,
+            "record_count": total,
+            "executed_count": executed,
+            "rejected_count": rejected,
+            "metrics": {
+                "fill_efficiency": fill_efficiency,
+                "avg_signal_confidence": avg_signal_confidence,
+                "avg_slippage_bps": avg_slippage_bps,
+                "edge_decay_bps": edge_decay_bps
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn api_get_signal_ontology(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Query(query): Query<SignalOntologyQuery>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow signal ontology access".to_string(),
+        );
+    }
+
+    let limit = query.limit.unwrap_or(400).clamp(1, 5_000);
+    let mut records = match list_registry_records_for_org(&state, identity.org_id, limit).await {
+        Ok(records) => records,
+        Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    if query.tradable_only.unwrap_or(false) {
+        records.retain(|record| record.lifecycle.is_tradable());
+    }
+    let domain_filter = query
+        .domain
+        .as_ref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+
+    let mut grouped: HashMap<(String, String), Vec<domain::CanonicalInstrument>> = HashMap::new();
+    for record in records {
+        let domain = infer_event_domain(&record);
+        if let Some(filter) = domain_filter.as_ref() {
+            if &domain != filter {
+                continue;
+            }
+        }
+        grouped
+            .entry((
+                record.canonical_event_id.clone(),
+                record.canonical_outcome_id.clone(),
+            ))
+            .or_default()
+            .push(record);
+    }
+
+    let mut items = Vec::new();
+    for ((event_id, outcome_id), mut group) in grouped {
+        group.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        let Some(primary) = group.first().cloned() else {
+            continue;
+        };
+        let domain = infer_event_domain(&primary);
+        let settlement_at = group
+            .iter()
+            .find_map(|record| extract_settlement_at(&record.metadata));
+        let venues = group
+            .iter()
+            .map(|record| {
+                serde_json::json!({
+                    "venue": venue_code(&record.venue),
+                    "symbol": record.symbol,
+                    "lifecycle": record.lifecycle,
+                    "confidence": record.confidence,
+                    "manual_override": record.manual_override,
+                    "updated_at": record.updated_at
+                })
+            })
+            .collect::<Vec<_>>();
+        items.push(serde_json::json!({
+            "canonical_event_id": event_id,
+            "canonical_outcome_id": outcome_id,
+            "canonical_event_title": primary.canonical_event_title,
+            "outcome_label": primary.outcome_label,
+            "domain": domain,
+            "settlement_at": settlement_at,
+            "settlement_window": settlement_window_label(settlement_at),
+            "venues": venues
+        }));
+    }
+
+    items.sort_by(|a, b| {
+        let a_updated = a
+            .get("venues")
+            .and_then(|venues| venues.as_array())
+            .and_then(|venues| venues.first())
+            .and_then(|entry| entry.get("updated_at"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let b_updated = b
+            .get("venues")
+            .and_then(|venues| venues.as_array())
+            .and_then(|venues| venues.first())
+            .and_then(|entry| entry.get("updated_at"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default()
+            .to_string();
+        b_updated.cmp(&a_updated)
+    });
+    if items.len() > limit {
+        items.truncate(limit);
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "count": items.len(),
+            "ontology": items
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Clone)]
+struct DislocationQuoteObservation {
+    canonical_event_id: String,
+    canonical_outcome_id: String,
+    canonical_event_title: Option<String>,
+    outcome_label: String,
+    domain: String,
+    venue: Venue,
+    symbol: String,
+    price: f64,
+    quote_at: DateTime<Utc>,
+    quote_age_secs: i64,
+    spread_bps: Option<f64>,
+    confidence: f64,
+    settlement_at: Option<DateTime<Utc>>,
+}
+
+async fn api_get_signal_dislocations(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Query(query): Query<SignalDislocationQuery>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow dislocation scans".to_string(),
+        );
+    }
+
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let min_spread_bps = query.min_spread_bps.unwrap_or(25.0).max(0.0);
+    let include_stale = query.include_stale.unwrap_or(false);
+    let max_quote_age_secs = query.max_quote_age_secs.unwrap_or(120).max(5);
+    let domain_filter = query
+        .domain
+        .as_ref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+
+    let records = match list_registry_records_for_org(&state, identity.org_id, 3_000).await {
+        Ok(records) => records,
+        Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    let adapter_registry = state.oms.adapter_registry();
+    let mut observations = Vec::new();
+    let now = Utc::now();
+    for record in records {
+        if !record.lifecycle.is_tradable() {
+            continue;
+        }
+        let domain = infer_event_domain(&record);
+        if let Some(filter) = domain_filter.as_ref() {
+            if &domain != filter {
+                continue;
+            }
+        }
+
+        let adapter = match adapter_registry.get(&record.venue) {
+            Ok(adapter) => adapter,
+            Err(_) => continue,
+        };
+        let quote = match adapter.fetch_quote(&record.symbol).await {
+            Ok(quote) => quote,
+            Err(_) => continue,
+        };
+        let price = quote
+            .last
+            .or_else(|| {
+                match (quote.bid, quote.ask) {
+                    (Some(bid), Some(ask)) if bid > 0.0 && ask > 0.0 => Some((bid + ask) / 2.0),
+                    _ => None,
+                }
+            })
+            .unwrap_or(0.0);
+        if price <= 0.0 || !price.is_finite() {
+            continue;
+        }
+        let age_secs = now
+            .signed_duration_since(quote.timestamp)
+            .num_seconds()
+            .max(0);
+        if !include_stale && age_secs > max_quote_age_secs {
+            continue;
+        }
+
+        observations.push(DislocationQuoteObservation {
+            canonical_event_id: record.canonical_event_id.clone(),
+            canonical_outcome_id: record.canonical_outcome_id.clone(),
+            canonical_event_title: record.canonical_event_title.clone(),
+            outcome_label: record.outcome_label.clone(),
+            domain,
+            venue: record.venue.clone(),
+            symbol: record.symbol.clone(),
+            price,
+            quote_at: quote.timestamp,
+            quote_age_secs: age_secs,
+            spread_bps: compute_spread_bps(&quote),
+            confidence: record.confidence,
+            settlement_at: extract_settlement_at(&record.metadata),
+        });
+    }
+
+    let mut grouped: HashMap<(String, String), Vec<DislocationQuoteObservation>> = HashMap::new();
+    for obs in observations {
+        grouped
+            .entry((obs.canonical_event_id.clone(), obs.canonical_outcome_id.clone()))
+            .or_default()
+            .push(obs);
+    }
+
+    let mut dislocations = Vec::new();
+    for ((event_id, outcome_id), mut group) in grouped {
+        if group.len() < 2 {
+            continue;
+        }
+        group.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(Ordering::Equal));
+        let min_obs = group.first().cloned();
+        let max_obs = group.last().cloned();
+        let (Some(min_obs), Some(max_obs)) = (min_obs, max_obs) else {
+            continue;
+        };
+        let mid = ((min_obs.price + max_obs.price) / 2.0).max(0.0001);
+        let spread_bps = ((max_obs.price - min_obs.price).abs() / mid) * 10_000.0;
+        if spread_bps < min_spread_bps {
+            continue;
+        }
+        let avg_confidence = group.iter().map(|entry| entry.confidence).sum::<f64>()
+            / group.len() as f64;
+        let venue_quotes = group
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "venue": venue_code(&entry.venue),
+                    "symbol": entry.symbol,
+                    "price": entry.price,
+                    "quote_at": entry.quote_at,
+                    "quote_age_secs": entry.quote_age_secs,
+                    "spread_bps": entry.spread_bps
+                })
+            })
+            .collect::<Vec<_>>();
+
+        dislocations.push(serde_json::json!({
+            "canonical_event_id": event_id,
+            "canonical_outcome_id": outcome_id,
+            "canonical_event_title": max_obs.canonical_event_title,
+            "outcome_label": max_obs.outcome_label,
+            "domain": max_obs.domain,
+            "settlement_at": max_obs.settlement_at,
+            "settlement_window": settlement_window_label(max_obs.settlement_at),
+            "spread_bps": spread_bps,
+            "implied_probability_spread": (max_obs.price - min_obs.price).abs(),
+            "min_price": {
+                "venue": venue_code(&min_obs.venue),
+                "symbol": min_obs.symbol,
+                "price": min_obs.price
+            },
+            "max_price": {
+                "venue": venue_code(&max_obs.venue),
+                "symbol": max_obs.symbol,
+                "price": max_obs.price
+            },
+            "average_confidence": avg_confidence,
+            "quotes": venue_quotes
+        }));
+    }
+
+    dislocations.sort_by(|a, b| {
+        let a_spread = a.get("spread_bps").and_then(|value| value.as_f64()).unwrap_or(0.0);
+        let b_spread = b.get("spread_bps").and_then(|value| value.as_f64()).unwrap_or(0.0);
+        b_spread.partial_cmp(&a_spread).unwrap_or(Ordering::Equal)
+    });
+    if dislocations.len() > limit {
+        dislocations.truncate(limit);
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "count": dislocations.len(),
+            "min_spread_bps": min_spread_bps,
+            "dislocations": dislocations
+        })),
+    )
+        .into_response()
+}
+
+async fn api_create_research_run(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<CreateResearchRunInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow recording research runs".to_string(),
+        );
+    }
+
+    let dataset_snapshot_id = payload.dataset_snapshot_id.trim().to_string();
+    let feature_set_hash = payload.feature_set_hash.trim().to_string();
+    let code_version = payload.code_version.trim().to_string();
+    let config_hash = payload.config_hash.trim().to_string();
+    if dataset_snapshot_id.is_empty()
+        || feature_set_hash.is_empty()
+        || code_version.is_empty()
+        || config_hash.is_empty()
+    {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "dataset_snapshot_id, feature_set_hash, code_version and config_hash are required"
+                .to_string(),
+        );
+    }
+
+    let baseline = if let Some(baseline_run_id) = payload.baseline_run_id {
+        match research_run_by_id(&state, identity.org_id, baseline_run_id).await {
+            Ok(run) => run,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    } else {
+        None
+    };
+    let acceptance = evaluate_research_acceptance(
+        &ResearchAcceptanceConfig::from_env(),
+        &payload.metrics,
+        baseline.as_ref(),
+    );
+    let status = acceptance.status.clone();
+    let record = ResearchRunRecord {
+        id: uuid::Uuid::new_v4(),
+        org_id: identity.org_id,
+        strategy_id: payload.strategy_id,
+        dataset_snapshot_id,
+        feature_set_hash,
+        code_version,
+        config_hash,
+        baseline_run_id: payload.baseline_run_id,
+        metrics: payload.metrics,
+        acceptance,
+        status,
+        artifact_uri: payload.artifact_uri.and_then(normalize_reason),
+        notes: payload.notes.and_then(normalize_reason),
+        created_at: Utc::now(),
+    };
+
+    let persisted = match persist_research_run(&state, record.clone()).await {
+        Ok(record) => record,
+        Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    state.event_bus.publish(
+        "research_pipeline",
+        serde_json::json!({
+            "event": "research_run_recorded",
+            "run_id": persisted.id,
+            "status": persisted.status,
+            "strategy_id": persisted.strategy_id
+        }),
+    );
+
+    (StatusCode::OK, Json(serde_json::json!({ "run": persisted }))).into_response()
+}
+
+async fn api_list_research_runs(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Query(query): Query<ResearchRunsQuery>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow research run listing".to_string(),
+        );
+    }
+
+    let limit = query.limit.unwrap_or(200).clamp(1, 5_000);
+    match list_research_runs(&state, identity.org_id, limit, query.strategy_id).await {
+        Ok(runs) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "count": runs.len(),
+                "runs": runs
+            })),
+        )
+            .into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+async fn api_get_research_run(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(run_id): Path<uuid::Uuid>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow research run access".to_string(),
+        );
+    }
+
+    match research_run_by_id(&state, identity.org_id, run_id).await {
+        Ok(Some(run)) => (StatusCode::OK, Json(serde_json::json!({ "run": run }))).into_response(),
+        Ok(None) => api_error(StatusCode::NOT_FOUND, format!("research run {} not found", run_id)),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+async fn api_recent_decision_traces(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Query(query): Query<DecisionTraceQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let venue_filter = query.venue.as_ref().map(|v| v.to_ascii_lowercase());
+
+    let records = if let Some(db) = &state.db {
+        match db.recent_order_audits(identity.org_id, limit).await {
+            Ok(records) => records,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    } else {
+        let oms = match state.oms.for_org(identity.org_id) {
+            Ok(oms) => oms,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        };
+        match oms.recent_audit_records(limit) {
+            Ok(records) => records,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    };
+
+    let scanned_records = records.len();
+    let traces: Vec<DecisionTraceView> = records
+        .into_iter()
+        .filter_map(|record| {
+            if let Some(strategy_id) = query.strategy_id {
+                if record.order.strategy_id != Some(strategy_id) {
+                    return None;
+                }
+            }
+
+            if let Some(mode) = query.mode {
+                if record.decision.effective != mode {
+                    return None;
+                }
+            }
+
+            if let Some(venue) = venue_filter.as_ref() {
+                if venue_code(&record.order.instrument.venue).to_ascii_lowercase() != *venue {
+                    return None;
+                }
+            }
+
+            let trace = record.decision_trace?;
+            Some(DecisionTraceView {
+                request_id: record.order.request_id,
+                user_id: record.order.user_id,
+                strategy_id: record.order.strategy_id,
+                venue: venue_code(&record.order.instrument.venue),
+                symbol: record.order.instrument.symbol,
+                recorded_at: record.recorded_at,
+                trace,
+            })
+        })
+        .collect();
+    let returned = traces.len();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "traces": traces,
+            "returned": returned,
+            "scanned_records": scanned_records
+        })),
+    )
+        .into_response()
+}
+
+async fn api_upsert_instrument_registry(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<UpsertCanonicalInstrumentInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow registry updates".to_string(),
+        );
+    }
+
+    let manual_override = payload.manual_override.unwrap_or(false);
+    if manual_override && !matches!(identity.role, Role::Admin) {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "manual_override requires admin role".to_string(),
+        );
+    }
+    let venue = match parse_venue(payload.venue.clone()) {
+        Ok(v) => v,
+        Err(err) => return api_error(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+    let symbol = payload.symbol.trim().to_uppercase();
+    if symbol.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "symbol is required".to_string());
+    }
+    let canonical_event_id = payload.canonical_event_id.trim().to_string();
+    if canonical_event_id.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "canonical_event_id is required".to_string(),
+        );
+    }
+    let canonical_outcome_id = payload.canonical_outcome_id.trim().to_string();
+    if canonical_outcome_id.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "canonical_outcome_id is required".to_string(),
+        );
+    }
+    let outcome_label = payload.outcome_label.trim().to_string();
+    if outcome_label.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "outcome_label is required".to_string(),
+        );
+    }
+
+    let now = Utc::now();
+    let record = domain::CanonicalInstrument {
+        id: uuid::Uuid::new_v4(),
+        canonical_event_id,
+        canonical_outcome_id,
+        canonical_event_title: payload
+            .canonical_event_title
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        outcome_label,
+        venue,
+        symbol,
+        confidence: payload.confidence.unwrap_or(0.75).clamp(0.0, 1.0),
+        lifecycle: payload
+            .lifecycle
+            .unwrap_or(domain::InstrumentLifecycle::Tradable),
+        manual_override,
+        metadata: payload.metadata.unwrap_or_else(|| serde_json::json!({})),
+        created_at: now,
+        updated_at: now,
+    };
+
+    let stored = if let Some(db) = &state.db {
+        match db.upsert_canonical_instrument(identity.org_id, &record).await {
+            Ok(record) => record,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    } else {
+        match state.registry.upsert(identity.org_id, record) {
+            Ok(record) => record,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    };
+
+    state.event_bus.publish(
+        "instrument_registry",
+        serde_json::json!({
+            "event": "registry_upsert",
+            "org_id": identity.org_id,
+            "actor_user_id": identity.user_id,
+            "canonical_event_id": stored.canonical_event_id,
+            "canonical_outcome_id": stored.canonical_outcome_id,
+            "venue": venue_code(&stored.venue),
+            "symbol": stored.symbol,
+            "lifecycle": stored.lifecycle
+        }),
+    );
+
+    (StatusCode::OK, Json(serde_json::json!({ "record": stored }))).into_response()
+}
+
+async fn api_list_instrument_registry(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Query(query): Query<InstrumentRegistryQuery>,
+) -> impl IntoResponse {
+    let records = if let Some(db) = &state.db {
+        match db.list_canonical_instruments(identity.org_id, &query).await {
+            Ok(records) => records,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    } else {
+        match state.registry.list(identity.org_id, &query) {
+            Ok(records) => records,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        }
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "records": records,
+            "count": records.len()
+        })),
+    )
+        .into_response()
 }
 
 async fn api_get_intel_claims(
@@ -2259,6 +4267,65 @@ async fn api_set_strategy_performance(
     }
 }
 
+async fn api_set_strategy_ensemble_policy(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Path(raw_agent_id): Path<String>,
+    Json(payload): Json<OrchestratorEnsemblePolicyInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow updating strategy ensemble policy".to_string(),
+        );
+    }
+    let agent_id = match uuid::Uuid::parse_str(raw_agent_id.trim()) {
+        Ok(id) => id,
+        Err(_) => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("invalid strategy agent id: {raw_agent_id}"),
+            )
+        }
+    };
+    match state.orchestrator.update_ensemble_policy(
+        agent_id,
+        EnsemblePolicyInput {
+            microstructure_score: payload.microstructure_score,
+            event_probability_score: payload.event_probability_score,
+            risk_allocator_score: payload.risk_allocator_score,
+            micro_weight: payload.micro_weight,
+            event_weight: payload.event_weight,
+            risk_weight: payload.risk_weight,
+            policy_version: payload.policy_version,
+        },
+    ) {
+        Ok(agent) => {
+            if let Ok(snapshot) = state.orchestrator.snapshot() {
+                if let Err(err) =
+                    persist_orchestrator_if_db(state.db.as_ref(), identity.org_id, &snapshot).await
+                {
+                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+                }
+            }
+            state.event_bus.publish(
+                "strategy_orchestrator",
+                serde_json::json!({
+                    "event": "ensemble_policy_updated",
+                    "agent": agent,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "label": identity.label,
+                        "role": role_code(&identity.role)
+                    }
+                }),
+            );
+            (StatusCode::OK, Json(agent)).into_response()
+        }
+        Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
 async fn api_evaluate_orchestrator(
     State(state): State<AppState>,
     Extension(identity): Extension<ApiIdentity>,
@@ -2302,6 +4369,248 @@ async fn api_evaluate_orchestrator(
                 }),
             );
             (StatusCode::OK, Json(snapshot)).into_response()
+        }
+        Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+async fn api_allocate_orchestrator_capital(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<OrchestratorCapitalAllocateInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_request_live() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "only admin role can run capital allocator".to_string(),
+        );
+    }
+
+    match state.orchestrator.allocate_capital(CapitalAllocationInput {
+        total_capital_override_usd: payload.total_capital_override_usd,
+        regime: payload.regime,
+        min_allocation_floor_usd: payload.min_allocation_floor_usd,
+    }) {
+        Ok(plan) => {
+            if let Ok(snapshot) = state.orchestrator.snapshot() {
+                if let Err(err) =
+                    persist_orchestrator_if_db(state.db.as_ref(), identity.org_id, &snapshot).await
+                {
+                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+                }
+            }
+            state.event_bus.publish(
+                "strategy_orchestrator",
+                serde_json::json!({
+                    "event": "capital_allocated",
+                    "plan": plan,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "label": identity.label,
+                        "role": role_code(&identity.role)
+                    }
+                }),
+            );
+            (StatusCode::OK, Json(plan)).into_response()
+        }
+        Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+async fn api_list_orchestrator_snapshots(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Query(query): Query<OrchestratorSnapshotsQuery>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow viewing orchestrator snapshots".to_string(),
+        );
+    }
+    let Some(db) = &state.db else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "database is required for orchestrator snapshot history".to_string(),
+        );
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    match db
+        .orchestrator_snapshot_history(identity.org_id, limit)
+        .await
+    {
+        Ok(snapshots) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "snapshots": snapshots,
+                "count": snapshots.len()
+            })),
+        )
+            .into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+async fn api_replay_orchestrator_snapshot(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<OrchestratorReplayInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_request_live() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "only admin role can replay orchestrator snapshots".to_string(),
+        );
+    }
+    let Some(db) = &state.db else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "database is required for orchestrator replay".to_string(),
+        );
+    };
+
+    let view = match db
+        .orchestrator_snapshot_by_id(identity.org_id, payload.snapshot_id)
+        .await
+    {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            return api_error(
+                StatusCode::NOT_FOUND,
+                format!("snapshot_id {} not found", payload.snapshot_id),
+            )
+        }
+        Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+
+    if let Err(err) = state.orchestrator.load_snapshot(view.snapshot.clone()) {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    state.event_bus.publish(
+        "strategy_orchestrator",
+        serde_json::json!({
+            "event": "snapshot_replayed",
+            "snapshot_id": view.snapshot_id,
+            "created_at": view.created_at,
+            "actor": {
+                "user_id": identity.user_id,
+                "label": identity.label,
+                "role": role_code(&identity.role)
+            }
+        }),
+    );
+
+    (StatusCode::OK, Json(view)).into_response()
+}
+
+async fn api_get_orchestrator_rollouts(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow viewing rollouts".to_string(),
+        );
+    }
+    match state.orchestrator.rollouts() {
+        Ok(rollouts) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "rollouts": rollouts,
+                "count": rollouts.len()
+            })),
+        )
+            .into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+async fn api_start_orchestrator_rollout(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<OrchestratorStartRolloutInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_request_live() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "only admin role can start champion/challenger rollouts".to_string(),
+        );
+    }
+
+    match state
+        .orchestrator
+        .start_challenger_rollout(orchestrator::StartChallengerInput {
+            champion_id: payload.champion_id,
+            challenger_id: payload.challenger_id,
+            shadow_allocation_usd: payload.shadow_allocation_usd,
+        }) {
+        Ok(rollout) => {
+            if let Ok(snapshot) = state.orchestrator.snapshot() {
+                if let Err(err) =
+                    persist_orchestrator_if_db(state.db.as_ref(), identity.org_id, &snapshot).await
+                {
+                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+                }
+            }
+            state.event_bus.publish(
+                "strategy_orchestrator",
+                serde_json::json!({
+                    "event": "rollout_started",
+                    "rollout": rollout,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "label": identity.label,
+                        "role": role_code(&identity.role)
+                    }
+                }),
+            );
+            (StatusCode::OK, Json(rollout)).into_response()
+        }
+        Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
+    }
+}
+
+async fn api_evaluate_orchestrator_rollouts(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+) -> impl IntoResponse {
+    if !identity.role.can_request_live() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "only admin role can evaluate champion/challenger rollouts".to_string(),
+        );
+    }
+
+    match state.orchestrator.evaluate_rollouts() {
+        Ok(rollouts) => {
+            if let Ok(snapshot) = state.orchestrator.snapshot() {
+                if let Err(err) =
+                    persist_orchestrator_if_db(state.db.as_ref(), identity.org_id, &snapshot).await
+                {
+                    return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+                }
+            }
+            state.event_bus.publish(
+                "strategy_orchestrator",
+                serde_json::json!({
+                    "event": "rollouts_evaluated",
+                    "rollouts": rollouts,
+                    "actor": {
+                        "user_id": identity.user_id,
+                        "label": identity.label,
+                        "role": role_code(&identity.role)
+                    }
+                }),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "rollouts": rollouts,
+                    "count": rollouts.len()
+                })),
+            )
+                .into_response()
         }
         Err(err) => api_error(StatusCode::BAD_REQUEST, err.to_string()),
     }
@@ -3131,6 +5440,293 @@ impl PgStore {
         Ok(out)
     }
 
+    async fn order_audit_by_request_id(
+        &self,
+        org_id: uuid::Uuid,
+        request_id: uuid::Uuid,
+    ) -> Result<Option<OrderAuditRecord>> {
+        let row = sqlx::query(
+            "SELECT record_json FROM order_audits WHERE org_id = $1 AND request_id = $2 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(org_id)
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch order audit by request id")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let value: serde_json::Value = row
+            .try_get("record_json")
+            .context("failed to parse record_json from row")?;
+        let record: OrderAuditRecord =
+            serde_json::from_value(value).context("invalid order_audit record_json payload")?;
+        Ok(Some(record))
+    }
+
+    async fn insert_research_run(&self, org_id: uuid::Uuid, record: &ResearchRunRecord) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO research_runs (
+                id,
+                org_id,
+                strategy_id,
+                status,
+                dataset_snapshot_id,
+                feature_set_hash,
+                code_version,
+                config_hash,
+                baseline_run_id,
+                metrics_json,
+                acceptance_json,
+                artifact_uri,
+                notes,
+                record_json,
+                created_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            "#,
+        )
+        .bind(record.id)
+        .bind(org_id)
+        .bind(record.strategy_id)
+        .bind(match record.status {
+            ResearchRunStatus::Pass => "pass",
+            ResearchRunStatus::Fail => "fail",
+            ResearchRunStatus::ManualReview => "manual_review",
+        })
+        .bind(&record.dataset_snapshot_id)
+        .bind(&record.feature_set_hash)
+        .bind(&record.code_version)
+        .bind(&record.config_hash)
+        .bind(record.baseline_run_id)
+        .bind(sqlx::types::Json(&record.metrics))
+        .bind(sqlx::types::Json(&record.acceptance))
+        .bind(&record.artifact_uri)
+        .bind(&record.notes)
+        .bind(sqlx::types::Json(record))
+        .bind(record.created_at)
+        .execute(&self.pool)
+        .await
+        .context("failed to insert research run")?;
+        Ok(())
+    }
+
+    async fn recent_research_runs(
+        &self,
+        org_id: uuid::Uuid,
+        limit: usize,
+        strategy_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<ResearchRunRecord>> {
+        let limit = limit.clamp(1, 5_000) as i64;
+        let rows = if let Some(strategy_id) = strategy_id {
+            sqlx::query(
+                "SELECT record_json FROM research_runs WHERE org_id = $1 AND strategy_id = $2 ORDER BY created_at DESC LIMIT $3",
+            )
+            .bind(org_id)
+            .bind(strategy_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to fetch strategy research runs")?
+        } else {
+            sqlx::query(
+                "SELECT record_json FROM research_runs WHERE org_id = $1 ORDER BY created_at DESC LIMIT $2",
+            )
+            .bind(org_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .context("failed to fetch research runs")?
+        };
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let payload: serde_json::Value = row.try_get("record_json")?;
+            let record: ResearchRunRecord = serde_json::from_value(payload)
+                .context("invalid research run payload in record_json")?;
+            out.push(record);
+        }
+        Ok(out)
+    }
+
+    async fn research_run_by_id(
+        &self,
+        org_id: uuid::Uuid,
+        run_id: uuid::Uuid,
+    ) -> Result<Option<ResearchRunRecord>> {
+        let row = sqlx::query(
+            "SELECT record_json FROM research_runs WHERE org_id = $1 AND id = $2 LIMIT 1",
+        )
+        .bind(org_id)
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch research run by id")?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let payload: serde_json::Value = row.try_get("record_json")?;
+        let record: ResearchRunRecord = serde_json::from_value(payload)
+            .context("invalid research run payload in record_json")?;
+        Ok(Some(record))
+    }
+
+    async fn upsert_canonical_instrument(
+        &self,
+        org_id: uuid::Uuid,
+        record: &domain::CanonicalInstrument,
+    ) -> Result<domain::CanonicalInstrument> {
+        let row = sqlx::query(
+            r#"
+            INSERT INTO canonical_instrument_registry (
+                id,
+                org_id,
+                canonical_event_id,
+                canonical_outcome_id,
+                canonical_event_title,
+                outcome_label,
+                venue,
+                symbol,
+                confidence,
+                lifecycle,
+                manual_override,
+                metadata_json,
+                created_at,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            ON CONFLICT (org_id, venue, symbol)
+            DO UPDATE SET
+                canonical_event_id = EXCLUDED.canonical_event_id,
+                canonical_outcome_id = EXCLUDED.canonical_outcome_id,
+                canonical_event_title = EXCLUDED.canonical_event_title,
+                outcome_label = EXCLUDED.outcome_label,
+                confidence = EXCLUDED.confidence,
+                lifecycle = EXCLUDED.lifecycle,
+                manual_override = EXCLUDED.manual_override,
+                metadata_json = EXCLUDED.metadata_json,
+                updated_at = EXCLUDED.updated_at
+            RETURNING
+                id,
+                canonical_event_id,
+                canonical_outcome_id,
+                canonical_event_title,
+                outcome_label,
+                venue,
+                symbol,
+                confidence,
+                lifecycle,
+                manual_override,
+                metadata_json,
+                created_at,
+                updated_at
+            "#,
+        )
+        .bind(record.id)
+        .bind(org_id)
+        .bind(&record.canonical_event_id)
+        .bind(&record.canonical_outcome_id)
+        .bind(&record.canonical_event_title)
+        .bind(&record.outcome_label)
+        .bind(venue_code(&record.venue))
+        .bind(record.symbol.to_ascii_uppercase())
+        .bind(record.confidence.clamp(0.0, 1.0))
+        .bind(lifecycle_code(record.lifecycle))
+        .bind(record.manual_override)
+        .bind(&record.metadata)
+        .bind(record.created_at)
+        .bind(Utc::now())
+        .fetch_one(&self.pool)
+        .await
+        .context("failed to upsert canonical instrument registry row")?;
+
+        map_canonical_instrument_row(row)
+    }
+
+    async fn list_canonical_instruments(
+        &self,
+        org_id: uuid::Uuid,
+        query: &InstrumentRegistryQuery,
+    ) -> Result<Vec<domain::CanonicalInstrument>> {
+        let limit = query.limit.unwrap_or(500).clamp(1, 2_000);
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id,
+                canonical_event_id,
+                canonical_outcome_id,
+                canonical_event_title,
+                outcome_label,
+                venue,
+                symbol,
+                confidence,
+                lifecycle,
+                manual_override,
+                metadata_json,
+                created_at,
+                updated_at
+            FROM canonical_instrument_registry
+            WHERE org_id = $1
+            ORDER BY updated_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(org_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to list canonical instrument registry rows")?;
+
+        let mut records = Vec::with_capacity(rows.len());
+        for row in rows {
+            records.push(map_canonical_instrument_row(row)?);
+        }
+        Ok(filter_registry_records(records, query))
+    }
+
+    async fn lookup_canonical_instrument(
+        &self,
+        org_id: uuid::Uuid,
+        venue: &Venue,
+        symbol: &str,
+    ) -> Result<Option<domain::CanonicalInstrument>> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                id,
+                canonical_event_id,
+                canonical_outcome_id,
+                canonical_event_title,
+                outcome_label,
+                venue,
+                symbol,
+                confidence,
+                lifecycle,
+                manual_override,
+                metadata_json,
+                created_at,
+                updated_at
+            FROM canonical_instrument_registry
+            WHERE org_id = $1
+              AND venue = $2
+              AND symbol = $3
+            LIMIT 1
+            "#,
+        )
+        .bind(org_id)
+        .bind(venue_code(venue))
+        .bind(symbol.trim().to_ascii_uppercase())
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to lookup canonical instrument registry row")?;
+
+        row.map(map_canonical_instrument_row).transpose()
+    }
+
     async fn create_api_key(
         &self,
         org_id: uuid::Uuid,
@@ -3665,6 +6261,17 @@ impl PgStore {
         .execute(&self.pool)
         .await
         .context("failed to upsert orchestrator snapshot")?;
+        sqlx::query(
+            r#"
+            INSERT INTO strategy_orchestrator_snapshot_history (org_id, snapshot_json)
+            VALUES ($1, $2)
+            "#,
+        )
+        .bind(org_id)
+        .bind(serde_json::to_value(snapshot).context("failed to encode orchestrator history snapshot")?)
+        .execute(&self.pool)
+        .await
+        .context("failed to append orchestrator snapshot history")?;
         Ok(())
     }
 
@@ -3691,6 +6298,72 @@ impl PgStore {
         let snapshot: orchestrator::OrchestratorSnapshot =
             serde_json::from_value(payload).context("invalid orchestrator snapshot JSON")?;
         Ok(Some(snapshot))
+    }
+
+    async fn orchestrator_snapshot_history(
+        &self,
+        org_id: uuid::Uuid,
+        limit: usize,
+    ) -> Result<Vec<OrchestratorSnapshotHistoryView>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, snapshot_json, created_at
+            FROM strategy_orchestrator_snapshot_history
+            WHERE org_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(org_id)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context("failed to fetch orchestrator snapshot history")?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let payload: serde_json::Value = row.try_get("snapshot_json")?;
+            let snapshot: orchestrator::OrchestratorSnapshot = serde_json::from_value(payload)
+                .context("invalid orchestrator history snapshot JSON")?;
+            out.push(OrchestratorSnapshotHistoryView {
+                snapshot_id: row.try_get("id")?,
+                created_at: row.try_get("created_at")?,
+                snapshot,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn orchestrator_snapshot_by_id(
+        &self,
+        org_id: uuid::Uuid,
+        snapshot_id: i64,
+    ) -> Result<Option<OrchestratorSnapshotHistoryView>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, snapshot_json, created_at
+            FROM strategy_orchestrator_snapshot_history
+            WHERE org_id = $1
+              AND id = $2
+            LIMIT 1
+            "#,
+        )
+        .bind(org_id)
+        .bind(snapshot_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch orchestrator snapshot by id")?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let payload: serde_json::Value = row.try_get("snapshot_json")?;
+        let snapshot: orchestrator::OrchestratorSnapshot =
+            serde_json::from_value(payload).context("invalid orchestrator snapshot payload")?;
+        Ok(Some(OrchestratorSnapshotHistoryView {
+            snapshot_id: row.try_get("id")?,
+            created_at: row.try_get("created_at")?,
+            snapshot,
+        }))
     }
 }
 
@@ -3773,6 +6446,27 @@ fn map_user_response(row: sqlx::postgres::PgRow) -> Result<UserResponse> {
         active,
         must_reset_password,
         created_at,
+    })
+}
+
+fn map_canonical_instrument_row(row: sqlx::postgres::PgRow) -> Result<domain::CanonicalInstrument> {
+    let venue_raw: String = row.try_get("venue")?;
+    let lifecycle_raw: String = row.try_get("lifecycle")?;
+    let metadata: serde_json::Value = row.try_get("metadata_json")?;
+    Ok(domain::CanonicalInstrument {
+        id: row.try_get("id")?,
+        canonical_event_id: row.try_get("canonical_event_id")?,
+        canonical_outcome_id: row.try_get("canonical_outcome_id")?,
+        canonical_event_title: row.try_get("canonical_event_title")?,
+        outcome_label: row.try_get("outcome_label")?,
+        venue: parse_venue(venue_raw)?,
+        symbol: row.try_get("symbol")?,
+        confidence: row.try_get("confidence")?,
+        lifecycle: parse_lifecycle(&lifecycle_raw)?,
+        manual_override: row.try_get("manual_override")?,
+        metadata,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 
@@ -3900,6 +6594,27 @@ fn role_code(role: &Role) -> &'static str {
     }
 }
 
+fn lifecycle_code(lifecycle: domain::InstrumentLifecycle) -> &'static str {
+    match lifecycle {
+        domain::InstrumentLifecycle::New => "new",
+        domain::InstrumentLifecycle::Tradable => "tradable",
+        domain::InstrumentLifecycle::WatchlistOnly => "watchlist_only",
+        domain::InstrumentLifecycle::Deprecated => "deprecated",
+    }
+}
+
+fn parse_lifecycle(raw: &str) -> Result<domain::InstrumentLifecycle> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "new" => Ok(domain::InstrumentLifecycle::New),
+        "tradable" => Ok(domain::InstrumentLifecycle::Tradable),
+        "watchlist_only" => Ok(domain::InstrumentLifecycle::WatchlistOnly),
+        "deprecated" => Ok(domain::InstrumentLifecycle::Deprecated),
+        _ => Err(anyhow!(
+            "invalid lifecycle `{raw}` (expected new|tradable|watchlist_only|deprecated)"
+        )),
+    }
+}
+
 fn parse_mode(raw: String) -> Result<ExecutionMode> {
     match raw.to_ascii_lowercase().as_str() {
         "paper" => Ok(ExecutionMode::Paper),
@@ -3914,6 +6629,7 @@ fn parse_venue(raw: String) -> Result<Venue> {
         "kalshi" => Ok(Venue::Kalshi),
         "ibkr" => Ok(Venue::Ibkr),
         "coinbase" => Ok(Venue::Coinbase),
+        "polymarket" => Ok(Venue::Polymarket),
         _ => Err(anyhow!("invalid venue: {raw}")),
     }
 }
@@ -3924,6 +6640,300 @@ fn parse_social_source(raw: String) -> Result<SocialSource> {
         "reddit" => Ok(SocialSource::Reddit),
         "manual" => Ok(SocialSource::Manual),
         _ => Err(anyhow!("invalid source `{raw}` (expected x|reddit|manual)")),
+    }
+}
+
+async fn enforce_registry_lifecycle(
+    state: &AppState,
+    org_id: uuid::Uuid,
+    venue: &Venue,
+    symbol: &str,
+) -> Result<(), Response> {
+    let lookup = if let Some(db) = &state.db {
+        db.lookup_canonical_instrument(org_id, venue, symbol)
+            .await
+            .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+    } else {
+        state
+            .registry
+            .lookup(org_id, venue, symbol)
+            .map_err(|err| api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+    };
+    let Some(record) = lookup else {
+        return Ok(());
+    };
+    if record.lifecycle.is_tradable() {
+        return Ok(());
+    }
+    Err(api_error(
+        StatusCode::FORBIDDEN,
+        format!(
+            "instrument {} on {} is {:?}; only tradable instruments can be ordered",
+            symbol,
+            venue_code(venue),
+            record.lifecycle
+        ),
+    ))
+}
+
+fn registry_key(venue: &Venue, symbol: &str) -> String {
+    format!(
+        "{}:{}",
+        venue_code(venue).to_ascii_lowercase(),
+        symbol.trim().to_ascii_uppercase()
+    )
+}
+
+fn filter_registry_records(
+    mut records: Vec<domain::CanonicalInstrument>,
+    query: &InstrumentRegistryQuery,
+) -> Vec<domain::CanonicalInstrument> {
+    let venue_filter = query
+        .venue
+        .as_ref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let symbol_filter = query
+        .symbol
+        .as_ref()
+        .map(|value| value.trim().to_ascii_uppercase())
+        .filter(|value| !value.is_empty());
+    let event_filter = query
+        .canonical_event_id
+        .as_ref()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty());
+    let lifecycle_filter = query.lifecycle;
+    records.retain(|record| {
+        if let Some(filter) = venue_filter.as_ref() {
+            if venue_code(&record.venue).to_ascii_lowercase() != *filter {
+                return false;
+            }
+        }
+        if let Some(filter) = symbol_filter.as_ref() {
+            if record.symbol.to_ascii_uppercase() != *filter {
+                return false;
+            }
+        }
+        if let Some(filter) = event_filter.as_ref() {
+            if record.canonical_event_id.to_ascii_lowercase() != *filter {
+                return false;
+            }
+        }
+        if let Some(filter) = lifecycle_filter {
+            if record.lifecycle != filter {
+                return false;
+            }
+        }
+        true
+    });
+    records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    let limit = query.limit.unwrap_or(200).clamp(1, 2_000);
+    if records.len() > limit {
+        records.truncate(limit);
+    }
+    records
+}
+
+async fn list_registry_records_for_org(
+    state: &AppState,
+    org_id: uuid::Uuid,
+    limit: usize,
+) -> Result<Vec<domain::CanonicalInstrument>> {
+    let query = InstrumentRegistryQuery {
+        venue: None,
+        symbol: None,
+        canonical_event_id: None,
+        lifecycle: None,
+        limit: Some(limit),
+    };
+    if let Some(db) = &state.db {
+        db.list_canonical_instruments(org_id, &query).await
+    } else {
+        state.registry.list(org_id, &query)
+    }
+}
+
+fn infer_event_domain(record: &domain::CanonicalInstrument) -> String {
+    if let Some(domain) = record
+        .metadata
+        .get("domain")
+        .and_then(|value| value.as_str())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    {
+        return domain;
+    }
+    let mut text = String::new();
+    if let Some(title) = &record.canonical_event_title {
+        text.push_str(title);
+        text.push(' ');
+    }
+    text.push_str(&record.outcome_label);
+    let lower = text.to_ascii_lowercase();
+
+    if lower.contains("election")
+        || lower.contains("senate")
+        || lower.contains("president")
+        || lower.contains("governor")
+        || lower.contains("congress")
+        || lower.contains("policy")
+    {
+        "politics".to_string()
+    } else if lower.contains("weather")
+        || lower.contains("rain")
+        || lower.contains("hurricane")
+        || lower.contains("temperature")
+    {
+        "weather".to_string()
+    } else if lower.contains("nba")
+        || lower.contains("nfl")
+        || lower.contains("sports")
+        || lower.contains("match")
+        || lower.contains("tournament")
+    {
+        "sports".to_string()
+    } else if lower.contains("btc")
+        || lower.contains("bitcoin")
+        || lower.contains("eth")
+        || lower.contains("crypto")
+        || lower.contains("sol")
+    {
+        "crypto".to_string()
+    } else if lower.contains("cpi")
+        || lower.contains("fed")
+        || lower.contains("rates")
+        || lower.contains("inflation")
+        || lower.contains("gdp")
+    {
+        "macro".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn extract_settlement_at(metadata: &serde_json::Value) -> Option<DateTime<Utc>> {
+    let metadata_obj = metadata.as_object()?;
+    for key in ["settlement_at", "event_time", "close_time", "resolution_time"] {
+        let Some(raw) = metadata_obj.get(key) else {
+            continue;
+        };
+        if let Some(text) = raw.as_str() {
+            if let Ok(dt) = DateTime::parse_from_rfc3339(text) {
+                return Some(dt.with_timezone(&Utc));
+            }
+        }
+    }
+    None
+}
+
+fn settlement_window_label(settlement_at: Option<DateTime<Utc>>) -> Option<String> {
+    let settlement_at = settlement_at?;
+    let now = Utc::now();
+    let hours = settlement_at.signed_duration_since(now).num_hours();
+    if hours <= 0 {
+        Some("settled_or_expired".to_string())
+    } else if hours <= 24 {
+        Some("within_24h".to_string())
+    } else if hours <= 72 {
+        Some("within_72h".to_string())
+    } else if hours <= 24 * 14 {
+        Some("within_2w".to_string())
+    } else {
+        Some("long_dated".to_string())
+    }
+}
+
+fn evaluate_research_acceptance(
+    config: &ResearchAcceptanceConfig,
+    metrics: &ResearchMetrics,
+    baseline: Option<&ResearchRunRecord>,
+) -> ResearchAcceptanceResult {
+    let thresholds = config.thresholds();
+    let mut reasons = Vec::new();
+    if metrics.sharpe < config.min_sharpe {
+        reasons.push(format!(
+            "sharpe {:.3} below minimum {:.3}",
+            metrics.sharpe, config.min_sharpe
+        ));
+    }
+    if metrics.max_drawdown_pct > config.max_drawdown_pct {
+        reasons.push(format!(
+            "max_drawdown_pct {:.2}% above limit {:.2}%",
+            metrics.max_drawdown_pct, config.max_drawdown_pct
+        ));
+    }
+    if metrics.trades < config.min_trades {
+        reasons.push(format!(
+            "trades {} below minimum {}",
+            metrics.trades, config.min_trades
+        ));
+    }
+    if metrics.total_return_pct < config.min_return_pct {
+        reasons.push(format!(
+            "total_return_pct {:.2}% below minimum {:.2}%",
+            metrics.total_return_pct, config.min_return_pct
+        ));
+    }
+
+    let sharpe_delta_vs_baseline = baseline.map(|baseline| metrics.sharpe - baseline.metrics.sharpe);
+    if let Some(delta) = sharpe_delta_vs_baseline {
+        if delta < config.min_sharpe_delta_vs_baseline {
+            reasons.push(format!(
+                "sharpe delta {:.3} below baseline threshold {:.3}",
+                delta, config.min_sharpe_delta_vs_baseline
+            ));
+        }
+    }
+
+    let pass = reasons.is_empty();
+    let status = if pass {
+        ResearchRunStatus::Pass
+    } else if reasons.len() == 1 && metrics.sharpe >= config.min_sharpe {
+        ResearchRunStatus::ManualReview
+    } else {
+        ResearchRunStatus::Fail
+    };
+    ResearchAcceptanceResult {
+        pass,
+        status,
+        reasons,
+        thresholds,
+        sharpe_delta_vs_baseline,
+    }
+}
+
+async fn persist_research_run(state: &AppState, record: ResearchRunRecord) -> Result<ResearchRunRecord> {
+    if let Some(db) = &state.db {
+        db.insert_research_run(record.org_id, &record).await?;
+    } else {
+        state.research.insert(record.clone())?;
+    }
+    Ok(record)
+}
+
+async fn list_research_runs(
+    state: &AppState,
+    org_id: uuid::Uuid,
+    limit: usize,
+    strategy_id: Option<uuid::Uuid>,
+) -> Result<Vec<ResearchRunRecord>> {
+    if let Some(db) = &state.db {
+        db.recent_research_runs(org_id, limit, strategy_id).await
+    } else {
+        state.research.list(org_id, limit, strategy_id)
+    }
+}
+
+async fn research_run_by_id(
+    state: &AppState,
+    org_id: uuid::Uuid,
+    run_id: uuid::Uuid,
+) -> Result<Option<ResearchRunRecord>> {
+    if let Some(db) = &state.db {
+        db.research_run_by_id(org_id, run_id).await
+    } else {
+        state.research.get(org_id, run_id)
     }
 }
 
@@ -3941,6 +6951,7 @@ fn default_symbol(venue: &Venue) -> &'static str {
         Venue::Kalshi => "KXBTCUSD-26DEC31-T200000.00",
         Venue::Ibkr => "265598",
         Venue::Coinbase => "BTC-USD",
+        Venue::Polymarket => "PRES-2028-DEM-WIN",
         _ => "UNKNOWN",
     }
 }
@@ -3948,6 +6959,7 @@ fn default_symbol(venue: &Venue) -> &'static str {
 fn default_asset_class(venue: &Venue) -> AssetClass {
     match venue {
         Venue::Kalshi => AssetClass::Prediction,
+        Venue::Polymarket => AssetClass::Prediction,
         Venue::Coinbase => AssetClass::Crypto,
         Venue::Ibkr => AssetClass::Equity,
         _ => AssetClass::Other,
@@ -3994,6 +7006,23 @@ fn split_sql_statements(sql: &str) -> Vec<&str> {
         .collect()
 }
 
+fn percentile_u128(mut values: Vec<u128>, percentile: f64) -> Option<u128> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let p = percentile.clamp(0.0, 1.0);
+    let idx = ((values.len() - 1) as f64 * p).ceil() as usize;
+    values.get(idx).copied()
+}
+
+fn mean_f64(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    Some(values.iter().sum::<f64>() / values.len() as f64)
+}
+
 fn env_bool(key: &str, default: bool) -> bool {
     std::env::var(key)
         .ok()
@@ -4023,6 +7052,34 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or(default)
+}
+
+fn env_optional_f64(key: &str) -> Option<f64> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+}
+
+fn env_optional_positive_f64(key: &str) -> Option<f64> {
+    env_optional_f64(key).filter(|value| value.is_finite() && *value > 0.0)
+}
+
+fn metadata_map_f64(
+    metadata: &indexmap::IndexMap<String, String>,
+    keys: &[&str],
+) -> Option<f64> {
+    for key in keys {
+        let Some(raw) = metadata.get(*key) else {
+            continue;
+        };
+        let Ok(parsed) = raw.trim().parse::<f64>() else {
+            continue;
+        };
+        if parsed.is_finite() {
+            return Some(parsed);
+        }
+    }
+    None
 }
 
 fn env_u32(key: &str, default: u32) -> u32 {

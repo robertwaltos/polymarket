@@ -12,3 +12,5 @@ risk = { path = "../risk" }
 anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
+tokio.workspace = true
+rand = "0.8.5"

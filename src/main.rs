@@ -11,6 +11,7 @@ mod kalshi_client;
 mod risk_engine;
 mod rl_agent;
 mod rl_training;
+mod scheduler;
 mod scraper_engine;
 mod state;
 mod strategy;
@@ -30,6 +31,7 @@ use crate::gamma_api::GammaClient;
 use crate::risk_engine::TradeSide;
 use crate::rl_agent::QLearningAgent;
 use crate::rl_training::offline_train;
+use crate::scheduler::schedule_candidates;
 use crate::scraper_engine::ScraperEngine;
 use crate::state::AgentState;
 use crate::strategy::Strategy;
@@ -243,7 +245,7 @@ async fn run_agent(
     };
     let mut state = AgentState::new(config.starting_balance_usdc);
     let bridge = BridgeClient::new(config.enable_arb_bridge, config.arbitrum_chain_id);
-    let federated = FederatedClient::new(config.enable_federated);
+    let federated = FederatedClient::from_config(&config);
 
     let mut paused = false;
     let mut edge_override: Option<f64> = None;
@@ -399,14 +401,51 @@ async fn run_agent(
             .fetch_all(include_politics, include_betting, include_local, &politics_hints)
             .await?;
 
+        let scheduled_candidates =
+            schedule_candidates(&strategy, &config, &external_data, candidates);
+        if scheduled_candidates.is_empty() {
+            info!("No candidates scheduled after EV-priority filtering.");
+            continue;
+        }
+
+        let scheduled_tokens: u64 = scheduled_candidates
+            .iter()
+            .map(|candidate| candidate.estimated_input_tokens)
+            .sum();
+        info!(
+            "Scheduler selected {} candidates (token_estimate={} ev_floor={:.3})",
+            scheduled_candidates.len(),
+            scheduled_tokens,
+            config.scheduler_ev_floor
+        );
+
         let mut claude_calls_this_cycle = 0usize;
-        for (market, niche) in candidates {
-            let kalshi_match = strategy.kalshi_match(&market, &external_data);
-            let predictit_match = strategy.predictit_match(&market, &external_data);
+        for scheduled in scheduled_candidates {
+            let crate::scheduler::ScheduledCandidate {
+                market,
+                niche,
+                kalshi_match,
+                predictit_match,
+                expected_value_score,
+                priority_score,
+                estimated_input_tokens,
+                settlement_hours,
+            } = scheduled;
 
             if config.execution_venue == ExecutionVenue::Kalshi && kalshi_match.is_none() {
                 continue;
             }
+
+            info!(
+                "Scheduled market {} priority={:.4} ev={:.4} est_tokens={} settlement_hours={}",
+                market.id,
+                priority_score,
+                expected_value_score,
+                estimated_input_tokens,
+                settlement_hours
+                    .map(|hours| format!("{hours:.1}"))
+                    .unwrap_or_else(|| "n/a".to_string())
+            );
 
             let mut exec_market = market.clone();
             if config.execution_venue == ExecutionVenue::Kalshi {
@@ -430,15 +469,7 @@ async fn run_agent(
                     break;
                 }
 
-                let estimated_input_tokens = strategy
-                    .estimate_input_tokens(
-                        &market,
-                        &external_data,
-                        niche,
-                        kalshi_match.as_ref(),
-                        predictit_match.as_ref(),
-                    )
-                    .max(1);
+                let estimated_input_tokens = estimated_input_tokens.max(1);
 
                 let used_input_tokens =
                     prune_anthropic_input_window(&mut anthropic_input_window, Instant::now());
@@ -669,8 +700,10 @@ async fn run_agent(
             }
 
             if config.enable_federated {
-                if let Some(agent) = rl_agent.as_ref() {
-                    let _ = federated.sync(agent);
+                if let Some(agent) = rl_agent.as_mut() {
+                    if let Err(err) = federated.sync(agent) {
+                        warn!("Federated sync failed: {}", err);
+                    }
                 }
             }
 
