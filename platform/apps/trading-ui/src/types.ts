@@ -52,11 +52,18 @@ export interface AuthLoginResponse {
 }
 
 export interface PositionSnapshot {
-  symbol: string;
+  instrument?: {
+    venue: string;
+    symbol: string;
+    asset_class: string;
+    quote_currency: string;
+  };
+  symbol?: string;
   quantity: number;
   average_price: number;
-  mark_price: number;
-  unrealized_pnl: number;
+  mark_price?: number;
+  market_price?: number | null;
+  unrealized_pnl?: number | null;
 }
 
 export interface PortfolioResponse {
@@ -121,6 +128,12 @@ export interface PlaceOrderInput {
   order_type: "limit" | "market";
   quantity: number;
   limit_price?: number;
+  mode?: ExecutionMode;
+}
+
+export interface ClosePositionInput {
+  venue: "coinbase" | "ibkr" | "kalshi";
+  symbol: string;
   mode?: ExecutionMode;
 }
 

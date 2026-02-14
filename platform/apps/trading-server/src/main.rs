@@ -733,6 +733,14 @@ struct ApiOrderInput {
 }
 
 #[derive(Debug, Deserialize)]
+struct ClosePositionInput {
+    venue: String,
+    symbol: String,
+    #[serde(default)]
+    mode: Option<ExecutionMode>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RecentOrdersQuery {
     #[serde(default)]
     limit: Option<usize>,
@@ -1437,6 +1445,7 @@ async fn serve_api(
 
     let protected = Router::new()
         .route("/v1/orders", post(api_place_order))
+        .route("/v1/positions/close", post(api_close_position))
         .route("/v1/portfolio", get(api_get_portfolio))
         .route("/v1/portfolio/history", get(api_portfolio_history))
         .route("/v1/orders/recent", get(api_recent_orders))
@@ -1669,7 +1678,80 @@ async fn api_place_order(
             "role does not allow placing orders".to_string(),
         );
     }
+    submit_order_from_input(&state, &identity, payload).await
+}
 
+async fn api_close_position(
+    State(state): State<AppState>,
+    Extension(identity): Extension<ApiIdentity>,
+    Json(payload): Json<ClosePositionInput>,
+) -> impl IntoResponse {
+    if !identity.role.can_trade() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "role does not allow closing positions".to_string(),
+        );
+    }
+
+    let venue = match parse_venue(payload.venue.clone()) {
+        Ok(v) => v,
+        Err(err) => return api_error(StatusCode::BAD_REQUEST, err.to_string()),
+    };
+
+    let raw_symbol = payload.symbol.trim();
+    if raw_symbol.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "symbol is required to close a position".to_string(),
+        );
+    }
+
+    let oms = match state.oms.for_org(identity.org_id) {
+        Ok(oms) => oms,
+        Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    let portfolio_snapshot = match oms.portfolio_snapshot_for_user(identity.user_id) {
+        Ok(snapshot) => snapshot,
+        Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    };
+    let target = portfolio_snapshot.positions().into_iter().find(|position| {
+        position.instrument.venue == venue
+            && position.instrument.symbol.eq_ignore_ascii_case(raw_symbol)
+            && position.quantity.abs() > f64::EPSILON
+    });
+    let Some(position) = target else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            format!("no open position for {} on {}", raw_symbol, venue_code(&venue)),
+        );
+    };
+
+    let close_side = if position.quantity > 0.0 {
+        Side::Sell
+    } else {
+        Side::Buy
+    };
+    let close_payload = ApiOrderInput {
+        venue: venue_code(&position.instrument.venue),
+        symbol: position.instrument.symbol,
+        asset_class: Some(position.instrument.asset_class),
+        quote_currency: Some(position.instrument.quote_currency),
+        side: close_side,
+        order_type: OrderType::Market,
+        time_in_force: Some(TimeInForce::Day),
+        quantity: position.quantity.abs(),
+        limit_price: position.market_price.or(Some(position.average_price)),
+        mode: payload.mode,
+        strategy_id: None,
+    };
+    submit_order_from_input(&state, &identity, close_payload).await
+}
+
+async fn submit_order_from_input(
+    state: &AppState,
+    identity: &ApiIdentity,
+    payload: ApiOrderInput,
+) -> Response {
     let venue = match parse_venue(payload.venue) {
         Ok(v) => v,
         Err(err) => return api_error(StatusCode::BAD_REQUEST, err.to_string()),

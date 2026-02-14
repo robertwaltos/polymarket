@@ -1,5 +1,6 @@
 import type {
   AuthLoginResponse,
+  ClosePositionInput,
   HealthResponse,
   LiveGuardSnapshot,
   LiveKillSwitchInput,
@@ -169,6 +170,17 @@ export class ApiClient {
     );
   }
 
+  async closePosition(payload: ClosePositionInput): Promise<PlaceOrderResponse> {
+    return this.request<PlaceOrderResponse>(
+      "/v1/positions/close",
+      {
+        method: "POST",
+        body: JSON.stringify(payload)
+      },
+      true
+    );
+  }
+
   private async request<T>(path: string, init?: RequestInit, auth = false): Promise<T> {
     const headers = new Headers(init?.headers);
     if (!headers.has("Content-Type")) {
@@ -207,5 +219,52 @@ function safeJsonParse(value: string): unknown {
 }
 
 export function defaultApiBaseUrl(): string {
-  return import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8080";
+  return import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:18080";
+}
+
+export async function discoverApiBaseUrl(): Promise<string> {
+  const fromEnv = import.meta.env.VITE_API_BASE_URL;
+  const candidates = uniqueCandidates([
+    fromEnv,
+    typeof window !== "undefined" ? window.location.origin : undefined,
+    "http://127.0.0.1:18080",
+    "http://localhost:18080",
+    "http://127.0.0.1:8080",
+    "http://localhost:8080"
+  ]);
+
+  for (const candidate of candidates) {
+    const ok = await probeHealth(candidate, 1200);
+    if (ok) return candidate;
+  }
+  return defaultApiBaseUrl();
+}
+
+function uniqueCandidates(values: Array<string | undefined>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const value of values) {
+    if (!value) continue;
+    const normalized = value.replace(/\/+$/, "");
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+async function probeHealth(baseUrl: string, timeoutMs: number): Promise<boolean> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(`${baseUrl}/v1/health`, {
+      method: "GET",
+      signal: controller.signal
+    });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    window.clearTimeout(timer);
+  }
 }

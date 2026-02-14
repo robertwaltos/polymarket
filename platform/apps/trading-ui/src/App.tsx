@@ -1,14 +1,13 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { ApiClient, defaultApiBaseUrl } from "./api";
+import { ApiClient, defaultApiBaseUrl, discoverApiBaseUrl } from "./api";
 import { SparklineChart } from "./components/SparklineChart";
 import type {
   AuthLoginResponse,
-  ExecutionMode,
+  ClosePositionInput,
   HealthResponse,
   LiveGuardSnapshot,
   LiveGuardVenueState,
   OrchestratorSnapshot,
-  PlaceOrderInput,
   PortfolioHistorySnapshot,
   PortfolioResponse,
   RecentOrderRecord,
@@ -34,24 +33,14 @@ interface ActivityItem {
 
 const SESSION_STORAGE_KEY = "atlas_trade_ui_session";
 const THEME_STORAGE_KEY = "atlas_trade_ui_theme";
-const BASE_URL_STORAGE_KEY = "atlas_trade_ui_base_url";
-
-const defaultOrderDraft = {
-  venue: "coinbase" as PlaceOrderInput["venue"],
-  symbol: "BTC-USD",
-  side: "buy" as PlaceOrderInput["side"],
-  orderType: "limit" as PlaceOrderInput["order_type"],
-  quantity: "0.10",
-  limitPrice: "100",
-  mode: "paper" as ExecutionMode
-};
 
 export default function App() {
   const [theme, setTheme] = useState<Theme>(() => {
     const saved = localStorage.getItem(THEME_STORAGE_KEY);
     return saved === "day" || saved === "night" ? saved : "night";
   });
-  const [baseUrl, setBaseUrl] = useState<string>(() => localStorage.getItem(BASE_URL_STORAGE_KEY) ?? defaultApiBaseUrl());
+  const [baseUrl, setBaseUrl] = useState<string>(defaultApiBaseUrl());
+  const [baseUrlResolved, setBaseUrlResolved] = useState<boolean>(false);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [liveGuards, setLiveGuards] = useState<LiveGuardSnapshot | null>(null);
   const [portfolio, setPortfolio] = useState<PortfolioResponse | null>(null);
@@ -73,10 +62,10 @@ export default function App() {
     email: "admin@localhost",
     password: ""
   });
-  const [orderDraft, setOrderDraft] = useState(defaultOrderDraft);
   const [busy, setBusy] = useState(false);
   const [guardBusy, setGuardBusy] = useState(false);
   const [automationBusy, setAutomationBusy] = useState(false);
+  const [closeBusyKeys, setCloseBusyKeys] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [killSwitchReason, setKillSwitchReason] = useState("");
   const [strategyDraft, setStrategyDraft] = useState({
@@ -96,8 +85,18 @@ export default function App() {
   }, [theme]);
 
   useEffect(() => {
-    localStorage.setItem(BASE_URL_STORAGE_KEY, baseUrl);
-  }, [baseUrl]);
+    let cancelled = false;
+    (async () => {
+      const discovered = await discoverApiBaseUrl();
+      if (!cancelled) {
+        setBaseUrl(discovered);
+        setBaseUrlResolved(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (session) {
@@ -108,14 +107,16 @@ export default function App() {
   }, [session]);
 
   useEffect(() => {
+    if (!baseUrlResolved) return;
     void loadHealth();
     const intervalId = window.setInterval(() => {
       void loadHealth();
     }, 8000);
     return () => window.clearInterval(intervalId);
-  }, [api]);
+  }, [api, baseUrlResolved]);
 
   useEffect(() => {
+    if (!baseUrlResolved) return;
     if (!session) {
       setPortfolio(null);
       setHistory([]);
@@ -132,10 +133,10 @@ export default function App() {
       void loadProtectedData();
     }, 10000);
     return () => window.clearInterval(intervalId);
-  }, [session, api]);
+  }, [session, api, baseUrlResolved]);
 
   useEffect(() => {
-    if (!session) return;
+    if (!session || !baseUrlResolved) return;
 
     const streamBase = baseUrl.replace(/\/+$/, "");
     const streamUrl = `${streamBase}/v1/stream?token=${encodeURIComponent(session.accessToken)}`;
@@ -239,20 +240,19 @@ export default function App() {
     return () => {
       source.close();
     };
-  }, [api, baseUrl, session]);
+  }, [api, baseUrl, session, baseUrlResolved]);
 
   const cashValue = portfolio?.cash_usd ?? 0;
   const positions = portfolio?.positions ?? [];
   const activePositions = positions.filter((position) => Math.abs(position.quantity) > 0);
   const exposure = activePositions.reduce(
-    (sum, position) => sum + Math.abs(position.quantity * (position.mark_price || position.average_price || 0)),
+    (sum, position) =>
+      sum +
+      Math.abs(position.quantity * (position.market_price ?? position.mark_price ?? position.average_price ?? 0)),
     0
   );
-  const unrealizedPnl = activePositions.reduce((sum, position) => sum + (position.unrealized_pnl || 0), 0);
+  const unrealizedPnl = activePositions.reduce((sum, position) => sum + (position.unrealized_pnl ?? 0), 0);
   const sparklinePoints = useMemo(() => buildSparklinePoints(history, cashValue), [history, cashValue]);
-  const selectedVenueGuard = liveGuards?.venues.find((entry) => entry.venue === orderDraft.venue);
-  const liveBlockedReason =
-    orderDraft.mode === "live" ? currentLiveBlockReason(liveGuards, selectedVenueGuard) : null;
 
   async function loadHealth() {
     try {
@@ -487,53 +487,48 @@ export default function App() {
     }
   }
 
-  async function handleSubmitOrder(event: FormEvent) {
-    event.preventDefault();
+  async function handleClosePosition(position: PortfolioResponse["positions"][number]) {
     if (!session) {
-      setError("Login required to submit orders.");
+      setError("Login required to close positions.");
       return;
     }
-    if (liveBlockedReason) {
-      setError(liveBlockedReason);
-      appendActivity("warn", `Live order blocked: ${liveBlockedReason}`);
+    const instrument = position.instrument;
+    if (!instrument) {
+      setError("Position instrument metadata missing; cannot close position.");
       return;
     }
-    const quantity = Number(orderDraft.quantity);
-    const limitPrice = Number(orderDraft.limitPrice);
-    if (!Number.isFinite(quantity) || quantity <= 0) {
-      setError("Quantity must be a positive number.");
+    const venue = normalizeVenueCode(instrument.venue);
+    if (!venue) {
+      setError(`Unsupported venue for manual close: ${instrument.venue}`);
       return;
     }
-    if (orderDraft.orderType === "limit" && (!Number.isFinite(limitPrice) || limitPrice <= 0)) {
-      setError("Limit price must be a positive number.");
+    const symbol = instrument.symbol.trim();
+    if (!symbol) {
+      setError("Position symbol missing; cannot close position.");
       return;
     }
 
-    setBusy(true);
+    const busyKey = `${venue}:${symbol}`;
+    setCloseBusyKeys((prev) => Array.from(new Set([...prev, busyKey])));
     try {
-      const payload: PlaceOrderInput = {
-        venue: orderDraft.venue,
-        symbol: orderDraft.symbol.trim(),
-        side: orderDraft.side,
-        order_type: orderDraft.orderType,
-        quantity,
-        mode: orderDraft.mode
+      const payload: ClosePositionInput = {
+        venue,
+        symbol,
+        mode: health?.execution_mode_default ?? "paper"
       };
-      if (orderDraft.orderType === "limit") {
-        payload.limit_price = limitPrice;
-      }
-      const response = await api.placeOrder(payload);
+      const response = await api.closePosition(payload);
       appendActivity(
-        "info",
-        `Order ${response.ack.request_id.slice(0, 8)} ${response.ack.status}: ${response.ack.message}`
+        "warn",
+        `Close ${symbol} -> ${response.ack.status}: ${response.ack.message}`
       );
       await loadProtectedData();
+      setError(null);
     } catch (err) {
       const message = errorMessage(err);
       setError(message);
-      appendActivity("error", `Order rejected: ${message}`);
+      appendActivity("error", `Close ${symbol} failed: ${message}`);
     } finally {
-      setBusy(false);
+      setCloseBusyKeys((prev) => prev.filter((entry) => entry !== busyKey));
     }
   }
 
@@ -564,17 +559,9 @@ export default function App() {
         </div>
 
         <div className="panel compact">
-          <label className="field-label" htmlFor="api-base-url">
-            API Base URL
-          </label>
-          <input
-            id="api-base-url"
-            className="field"
-            value={baseUrl}
-            onChange={(event) => setBaseUrl(event.target.value)}
-            placeholder="http://127.0.0.1:8080"
-          />
-          <p className="hint">Point this UI at your local or remote trading-server.</p>
+          <h2 className="panel-title">Backend</h2>
+          <p className="mono">{baseUrlResolved ? baseUrl : "Detecting..."}</p>
+          <p className="hint">Auto-discovered trading-server endpoint.</p>
         </div>
 
         {!session ? (
@@ -792,12 +779,12 @@ export default function App() {
                     </tr>
                   ) : (
                     activePositions.map((position) => (
-                      <tr key={`${position.symbol}-${position.quantity}`}>
-                        <td>{position.symbol}</td>
+                      <tr key={`${positionInstrument(position).venue}:${positionSymbol(position)}:${position.quantity}`}>
+                        <td>{positionSymbol(position)}</td>
                         <td>{position.quantity.toFixed(3)}</td>
-                        <td>${(position.mark_price || 0).toFixed(2)}</td>
-                        <td className={position.unrealized_pnl >= 0 ? "pos" : "neg"}>
-                          {(position.unrealized_pnl || 0).toFixed(2)}
+                        <td>${positionMarketPrice(position).toFixed(2)}</td>
+                        <td className={(position.unrealized_pnl ?? 0) >= 0 ? "pos" : "neg"}>
+                          {(position.unrealized_pnl ?? 0).toFixed(2)}
                         </td>
                       </tr>
                     ))
@@ -809,113 +796,61 @@ export default function App() {
 
           <article className="panel">
             <div className="panel-header">
-              <h3 className="panel-title">Order Ticket</h3>
-              <p className="hint">Low-friction manual intervention</p>
+              <h3 className="panel-title">Open Trades</h3>
+              <p className="hint">Agent-managed positions with manual force-close</p>
             </div>
-            <form className="order-form" onSubmit={handleSubmitOrder}>
-              <div className="split two">
-                <label>
-                  Venue
-                  <select
-                    className="field"
-                    value={orderDraft.venue}
-                    onChange={(event) =>
-                      setOrderDraft((prev) => ({
-                        ...prev,
-                        venue: event.target.value as PlaceOrderInput["venue"]
-                      }))
-                    }
-                  >
-                    <option value="coinbase">Coinbase</option>
-                    <option value="ibkr">IBKR</option>
-                    <option value="kalshi">Kalshi</option>
-                  </select>
-                </label>
-                <label>
-                  Mode
-                  <select
-                    className="field"
-                    value={orderDraft.mode}
-                    onChange={(event) =>
-                      setOrderDraft((prev) => ({
-                        ...prev,
-                        mode: event.target.value as ExecutionMode
-                      }))
-                    }
-                  >
-                    <option value="paper">Paper</option>
-                    <option value="shadow">Shadow</option>
-                    <option value="live">Live</option>
-                  </select>
-                </label>
-              </div>
-              <label>
-                Symbol
-                <input
-                  className="field"
-                  value={orderDraft.symbol}
-                  onChange={(event) => setOrderDraft((prev) => ({ ...prev, symbol: event.target.value }))}
-                />
-              </label>
-              <div className="split three">
-                <label>
-                  Side
-                  <select
-                    className="field"
-                    value={orderDraft.side}
-                    onChange={(event) =>
-                      setOrderDraft((prev) => ({
-                        ...prev,
-                        side: event.target.value as PlaceOrderInput["side"]
-                      }))
-                    }
-                  >
-                    <option value="buy">Buy</option>
-                    <option value="sell">Sell</option>
-                  </select>
-                </label>
-                <label>
-                  Type
-                  <select
-                    className="field"
-                    value={orderDraft.orderType}
-                    onChange={(event) =>
-                      setOrderDraft((prev) => ({
-                        ...prev,
-                        orderType: event.target.value as PlaceOrderInput["order_type"]
-                      }))
-                    }
-                  >
-                    <option value="limit">Limit</option>
-                    <option value="market">Market</option>
-                  </select>
-                </label>
-                <label>
-                  Quantity
-                  <input
-                    className="field"
-                    inputMode="decimal"
-                    value={orderDraft.quantity}
-                    onChange={(event) => setOrderDraft((prev) => ({ ...prev, quantity: event.target.value }))}
-                  />
-                </label>
-              </div>
-              {orderDraft.orderType === "limit" && (
-                <label>
-                  Limit Price
-                  <input
-                    className="field"
-                    inputMode="decimal"
-                    value={orderDraft.limitPrice}
-                    onChange={(event) => setOrderDraft((prev) => ({ ...prev, limitPrice: event.target.value }))}
-                  />
-                </label>
-              )}
-              {liveBlockedReason && <p className="hint danger-text">Live blocked: {liveBlockedReason}</p>}
-              <button type="submit" className="button primary" disabled={busy || guardBusy || !session || Boolean(liveBlockedReason)}>
-                {busy ? "Submitting..." : "Submit Order"}
-              </button>
-            </form>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Venue</th>
+                    <th>Symbol</th>
+                    <th>Qty</th>
+                    <th>Mark</th>
+                    <th>UPnL</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {activePositions.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="empty-row">
+                        No open trades
+                      </td>
+                    </tr>
+                  ) : (
+                    activePositions.map((position) => {
+                      const instrument = positionInstrument(position);
+                      const venue = normalizeVenueCode(instrument.venue);
+                      const symbol = positionSymbol(position);
+                      const busyKey = venue ? `${venue}:${symbol}` : "";
+                      const isClosing = busyKey ? closeBusyKeys.includes(busyKey) : false;
+                      return (
+                        <tr key={`${instrument.venue}:${symbol}:${position.quantity}`}>
+                          <td>{instrument.venue.toUpperCase()}</td>
+                          <td>{symbol}</td>
+                          <td>{position.quantity.toFixed(3)}</td>
+                          <td>${positionMarketPrice(position).toFixed(2)}</td>
+                          <td className={(position.unrealized_pnl ?? 0) >= 0 ? "pos" : "neg"}>
+                            {(position.unrealized_pnl ?? 0).toFixed(2)}
+                          </td>
+                          <td>
+                            <button
+                              type="button"
+                              className="button tiny danger"
+                              disabled={!session || !venue || isClosing || automationBusy}
+                              onClick={() => void handleClosePosition(position)}
+                            >
+                              {isClosing ? "Closing..." : "Close"}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
           </article>
 
           <article className="panel">
@@ -1170,18 +1105,31 @@ function parseStreamEnvelope(raw: string): unknown {
   }
 }
 
-function currentLiveBlockReason(
-  snapshot: LiveGuardSnapshot | null,
-  venueState: LiveGuardVenueState | undefined
-): string | null {
-  if (!snapshot) return "live guard state unavailable";
-  if (snapshot.global.kill_switch_enabled) {
-    return snapshot.global.kill_switch_reason || "global kill switch engaged";
+function positionInstrument(position: PortfolioResponse["positions"][number]) {
+  if (position.instrument) {
+    return position.instrument;
   }
-  if (!venueState) return "venue guard unavailable";
-  if (!venueState.live_allowed_now) {
-    return venueState.block_reason || "venue blocked by guard policy";
-  }
+  return {
+    venue: "unknown",
+    symbol: position.symbol ?? "UNKNOWN",
+    asset_class: "other",
+    quote_currency: "USD"
+  };
+}
+
+function positionSymbol(position: PortfolioResponse["positions"][number]): string {
+  return positionInstrument(position).symbol;
+}
+
+function positionMarketPrice(position: PortfolioResponse["positions"][number]): number {
+  return position.market_price ?? position.mark_price ?? position.average_price ?? 0;
+}
+
+function normalizeVenueCode(raw: string): ClosePositionInput["venue"] | null {
+  const lowered = raw.trim().toLowerCase();
+  if (lowered === "coinbase") return "coinbase";
+  if (lowered === "ibkr") return "ibkr";
+  if (lowered === "kalshi") return "kalshi";
   return null;
 }
 
